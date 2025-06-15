@@ -3,20 +3,17 @@ import customtkinter as ctk
 from tkinter import ttk, messagebox, TclError
 from PIL import Image
 import threading
-import webbrowser
 import io
 import time
 from datetime import datetime, timedelta, timezone
 import requests
 from collections import defaultdict, deque
-import math
-from urllib.parse import quote
 import re
 
 # Interne importer
 import config
 import api
-import auth
+import auth  # Importerer den oppdaterte auth-modulen med AuthManager
 import db
 from logic import calculations, scanners
 from ui.tabs import (
@@ -34,7 +31,12 @@ class EveMarketApp(ctk.CTk):
         self.geometry("1600x900")
         ctk.set_appearance_mode("dark")
         
-        self.character_info = {}
+        # =====================================================================
+        # == REFAKTORERING: AuthManager-instans opprettes her
+        # =====================================================================
+        self.auth_manager = auth.AuthManager(self.settings)
+
+        # Applikasjonstilstand
         self.scan_thread = None
         self.scanning_active = threading.Event()
         self.wallet_balance = 0.0
@@ -47,30 +49,47 @@ class EveMarketApp(ctk.CTk):
         self._create_widgets()
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
         
+        # Start-oppgaver
         self.load_all_regions()
         threading.Thread(target=self.populate_industry_systems, daemon=True).start()
         self.after(500, self.initial_auth_check)
         self.show_frame("character")
 
     def _initialize_variables(self):
+        """Initialiserer alle ctk-variabler for UI-elementer."""
+        # Generelle innstillinger
         self.sales_tax_var = ctk.StringVar(value=self.settings.get('sales_tax', '8.0'))
         self.brokers_fee_var = ctk.StringVar(value=self.settings.get('brokers_fee', '3.0'))
-        self.esi_client_id_var = ctk.StringVar(value=self.settings.get('esi_client_id'))
-        self.esi_secret_key_var = ctk.StringVar(value=self.settings.get('esi_secret_key'))
+        
+        # =====================================================================
+        # == REFAKTORERING: ESI-variabler med "trace"
+        # == Dette sørger for at AuthManager alltid har de nyeste verdiene
+        # == fra input-feltene i sanntid, uten behov for en "lagre"-knapp.
+        # =====================================================================
+        self.esi_client_id_var = ctk.StringVar(value=self.settings.get('esi_client_id', ''))
+        self.esi_secret_key_var = ctk.StringVar(value=self.settings.get('esi_secret_key', ''))
+        
+        self.esi_client_id_var.trace_add("write", lambda *args: self.settings.update({'esi_client_id': self.esi_client_id_var.get()}))
+        self.esi_secret_key_var.trace_add("write", lambda *args: self.settings.update({'esi_secret_key': self.esi_secret_key_var.get()}))
+
+        # Variabler for de ulike fanene
         self.analyse_item_name_var = ctk.StringVar(value=self.settings.get('analyse_item_name'))
         self.analyse_buy_station_var = ctk.StringVar(value=self.settings.get('analyse_buy_station'))
         self.analyse_sell_station_var = ctk.StringVar(value=self.settings.get('analyse_sell_station'))
         self.analyse_sell_method_var = ctk.StringVar(value=self.settings.get('analyse_sell_method'))
         self.analyse_ship_cargo_var = ctk.StringVar(value=self.settings.get('analyse_ship_cargo'))
+        
         self.manu_item_name_var = ctk.StringVar()
         self.manu_me_var = ctk.StringVar(value="10")
         self.manu_te_var = ctk.StringVar(value="20")
         self.manu_system_var = ctk.StringVar(value="Jita")
+        
         self.bpo_me_var = ctk.StringVar(value="10")
         self.bpo_te_var = ctk.StringVar(value="20")
         self.bpo_system_var = ctk.StringVar(value="Jita")
         self.bpo_min_profit_ph_var = ctk.StringVar(value="1000000")
         self.bpo_min_daily_volume_var = ctk.StringVar(value="100")
+        
         for scan_type in ["scanner", "arbitrage", "region", "galaxy"]:
             defaults = config.load_settings()
             setattr(self, f"{scan_type}_buy_station_var", ctk.StringVar(value=defaults.get(f"{scan_type}_buy_station")))
@@ -96,6 +115,8 @@ class EveMarketApp(ctk.CTk):
         self.price_hunter_nullsec_var = ctk.BooleanVar(value=False)
 
     def _create_widgets(self):
+        """Setter opp hoved-layout og UI-elementer."""
+        # Stil for Treeview-elementer
         style = ttk.Style()
         style.theme_use("default")
         style.configure("Treeview", background="#2B2B2B", foreground="white", fieldbackground="#2B2B2B", borderwidth=0, rowheight=35, font=ctk.CTkFont(size=14))
@@ -103,19 +124,24 @@ class EveMarketApp(ctk.CTk):
         style.configure("Treeview.Heading", font=ctk.CTkFont(size=15, weight="bold"), padding=10)
         style.layout("Treeview", [('Treeview.treearea', {'sticky': 'nswe'})])
         
+        # Hoved-grid
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
+        # Sidebar-ramme
         self.sidebar_frame = ctk.CTkFrame(self, width=220, corner_radius=0)
         self.sidebar_frame.grid(row=0, column=0, rowspan=2, sticky="nsw")
         self.sidebar_frame.grid_rowconfigure(14, weight=1)
 
+        # Hovedinnhold-ramme
         self.main_content_frame = ctk.CTkFrame(self, fg_color="transparent")
         self.main_content_frame.grid(row=0, column=1, sticky="nsew", padx=20, pady=20)
         
+        # Statuslinje nederst
         self.status_label = ctk.CTkLabel(self, text="Klar", height=24, anchor="w", text_color=("gray60", "gray40"), font=ctk.CTkFont(size=12))
         self.status_label.grid(row=1, column=1, padx=20, pady=(0, 10), sticky="ew")
 
+        # Opprett alle "sidene" (rammene) for de ulike fanene
         self.frames = {}
         self.tab_creators = {
             "character": character.create_tab, "assets": assets.create_tab,
@@ -135,6 +161,7 @@ class EveMarketApp(ctk.CTk):
         self._create_right_click_menu()
 
     def _create_sidebar(self):
+        """Bygger knappene og etikettene i sidebaren."""
         logo_label = ctk.CTkLabel(self.sidebar_frame, text="EVE Intel", font=ctk.CTkFont(size=28, weight="bold"))
         logo_label.grid(row=0, column=0, padx=20, pady=(20, 10))
         
@@ -217,10 +244,11 @@ class EveMarketApp(ctk.CTk):
     
     def clear_tree(self, tree):
         try:
-            if tree:
+            if tree and tree.winfo_exists():
                 for i in tree.get_children(): tree.delete(i)
         except TclError: pass
 
+    # --- Autocomplete/Suggestion Box Logic (UI Helper) ---
     def _update_suggestions(self, event):
         entry_widget = event.widget
         self.active_suggestion_entry = entry_widget
@@ -228,7 +256,7 @@ class EveMarketApp(ctk.CTk):
         if len(search_term) > 1:
             suggestions = [name for name in config.ITEM_NAME_TO_ID.keys() if search_term in name.lower()][:10]
             if suggestions:
-                if not hasattr(self, 'suggestions_listbox'):
+                if not hasattr(self, 'suggestions_listbox') or not self.suggestions_listbox.winfo_exists():
                     self.suggestions_listbox = tkinter.Listbox(self, bg="#2B2B2B", fg="white", highlightthickness=0, borderwidth=1, font=("Segoe UI", 12), relief="flat")
                     self.suggestions_listbox.bind("<ButtonRelease-1>", self._on_suggestion_select)
                 self.suggestions_listbox.delete(0, tkinter.END)
@@ -240,7 +268,7 @@ class EveMarketApp(ctk.CTk):
                 self.suggestions_listbox.place(x=x, y=y, width=width, height=150)
                 self.suggestions_listbox.tkraise()
                 return
-        if hasattr(self, 'suggestions_listbox'):
+        if hasattr(self, 'suggestions_listbox') and self.suggestions_listbox.winfo_exists():
             self.suggestions_listbox.place_forget()
 
     def _on_suggestion_select(self, event):
@@ -252,7 +280,7 @@ class EveMarketApp(ctk.CTk):
             self.active_suggestion_entry.insert(0, selected_item)
             self.suggestions_listbox.place_forget()
             self.active_suggestion_entry = None
-        except TclError:
+        except (TclError, IndexError):
             pass
 
     def _hide_suggestions_on_click_away(self, event=None):
@@ -263,16 +291,13 @@ class EveMarketApp(ctk.CTk):
                     self.suggestions_listbox.place_forget()
                     self.active_suggestion_entry = None
 
-            if hasattr(self, 'bpo_system_entry') and hasattr(self.bpo_system_entry, 'system_suggestions_listbox') and self.bpo_system_entry.system_suggestions_listbox.winfo_viewable():
-                 widget = event.widget if event else None
-                 if not widget or (widget != self.bpo_system_entry.system_suggestions_listbox and widget != self.bpo_system_entry):
-                    self.bpo_system_entry.system_suggestions_listbox.place_forget()
-
-            if hasattr(self, 'manu_system_entry') and hasattr(self.manu_system_entry, 'system_suggestions_listbox') and self.manu_system_entry.system_suggestions_listbox.winfo_viewable():
-                 widget = event.widget if event else None
-                 if not widget or (widget != self.manu_system_entry.system_suggestions_listbox and widget != self.manu_system_entry):
-                    self.manu_system_entry.system_suggestions_listbox.place_forget()
-
+            for entry_attr in ['bpo_system_entry', 'manu_system_entry']:
+                if hasattr(self, entry_attr):
+                    entry_obj = getattr(self, entry_attr)
+                    if hasattr(entry_obj, 'system_suggestions_listbox') and entry_obj.system_suggestions_listbox.winfo_viewable():
+                        widget = event.widget if event else None
+                        if not widget or (widget != entry_obj.system_suggestions_listbox and widget != entry_obj):
+                            entry_obj.system_suggestions_listbox.place_forget()
         except (TclError, AttributeError):
             pass
     
@@ -313,7 +338,7 @@ class EveMarketApp(ctk.CTk):
             entry_var.set(selected_item)
             listbox_owner.system_suggestions_listbox.place_forget()
             self.after(50, lambda: self._update_system_cost_index_display(entry_var, listbox_owner))
-        except TclError:
+        except (TclError, IndexError):
             pass
             
     def _update_system_cost_index_display(self, system_var, listbox_owner):
@@ -337,82 +362,97 @@ class EveMarketApp(ctk.CTk):
                 return
         
         label_to_update.configure(text="Indeks: N/A")
+    
+    # =========================================================================
+    # == REFAKTORERT AUTENTISERINGSLOGIKK (bruker nå AuthManager)
+    # =========================================================================
 
     def start_oauth_flow(self):
-        client_id = self.esi_client_id_var.get()
-        if not client_id or not self.esi_secret_key_var.get():
-            self.show_error("ESI Client ID og/eller Secret Key mangler.")
-            return
-        auth.AUTH_CODE = None
-        auth.OAUTH_STATE = auth.generate_oauth_state()
-        auth_url = auth.get_auth_url(client_id, auth.OAUTH_STATE)
-        webbrowser.open(auth_url)
-        self.status_label.configure(text="Venter på EVE Online-innlogging...")
-        threading.Thread(target=auth.run_callback_server, daemon=True).start()
-        self.check_auth_code()
+        """Starter OAuth-flyten ved å delegere til AuthManager."""
+        success, message = self.auth_manager.start_oauth_flow(
+            lambda msg: self.status_label.configure(text=msg)
+        )
+        if success:
+            self.check_auth_code() # Start polling for auth code
+        else:
+            self.show_error(message)
 
     def check_auth_code(self):
+        """Sjekker periodisk om en auth-kode har blitt mottatt via callback."""
         if auth.AUTH_CODE:
-            self.status_label.configure(text="Kode mottatt, henter tokens...")
-            self.get_tokens_from_code(auth.AUTH_CODE)
-            auth.AUTH_CODE = None
+            self.status_label.configure(text="Kode mottatt, verifiserer med ESI...")
+            # Deleger token-henting til AuthManager
+            if self.auth_manager.get_tokens_from_code(auth.AUTH_CODE):
+                auth.AUTH_CODE = None  # Nullstill global variabel etter bruk
+                self.fetch_character_data()  # Start datainnhenting umiddelbart
+            else:
+                self.show_error("Kunne ikke hente tokens fra ESI. Sjekk Client ID/Secret Key.")
+                self.status_label.configure(text="Innlogging feilet.")
         else:
+            # Hvis ingen kode, sjekk igjen om 1 sekund
             self.after(1000, self.check_auth_code)
 
-    def get_tokens_from_code(self, code):
-        tokens = api.fetch_tokens_from_code(self.esi_client_id_var.get(), self.esi_secret_key_var.get(), code)
-        if not tokens: self.show_error("Kunne ikke hente tokens."); return
-        self.settings['access_token'] = tokens['access_token']
-        self.settings['refresh_token'] = tokens['refresh_token']
-        self.settings['token_expiry'] = (datetime.utcnow() + timedelta(seconds=tokens['expires_in'])).isoformat()
-        self.fetch_character_data()
-
-    def refresh_access_token(self):
-        if not self.settings.get("refresh_token"): return False
-        tokens = api.refresh_esi_tokens(self.esi_client_id_var.get(), self.esi_secret_key_var.get(), self.settings.get("refresh_token"))
-        if tokens:
-            self.settings['access_token'] = tokens['access_token']
-            self.settings['token_expiry'] = (datetime.utcnow() + timedelta(seconds=tokens['expires_in'])).isoformat()
-            self.fetch_character_data()
-            return True
+    def _handle_token_refresh(self):
+        """Bakgrunnstråd-funksjon for å fornye token og oppdatere UI."""
+        if self.auth_manager.refresh_access_token():
+            self.after(0, self.fetch_character_data)
         else:
-            for key in ['access_token', 'refresh_token', 'token_expiry']: self.settings[key] = None
-            self.char_name_label.configure(text="Ikke innlogget (sesjon utløpt)")
-            return False
+            # Hvis fornyelse feiler, oppdater UI for å vise "utlogget" status
+            self.after(0, self.update_ui_for_logout)
 
-    def is_token_valid(self):
-        expiry_str = self.settings.get("token_expiry")
-        if not expiry_str: return False
-        try: return datetime.fromisoformat(expiry_str) > datetime.utcnow()
-        except ValueError: return False
+    def initial_auth_check(self):
+        """Sjekker for et lagret refresh token ved oppstart og prøver å logge inn."""
+        if self.settings.get("refresh_token") and self.esi_client_id_var.get():
+            self.status_label.configure(text="Logger inn med lagret sesjon...")
+            threading.Thread(target=self._handle_token_refresh, daemon=True).start()
 
-    def get_valid_token(self):
-        if self.is_token_valid(): return self.settings['access_token']
-        if self.settings.get("refresh_token") and self.refresh_access_token():
-            return self.settings['access_token']
-        return None
+    def update_ui_for_logout(self):
+        """Nullstiller all karakterspesifikk UI til en utlogget tilstand."""
+        self.char_name_label.configure(text="Ikke innlogget")
+        self.wallet_label.configure(text="Wallet: N/A")
+        self.profit_label.configure(text="Netto handel: N/A", text_color="white")
+        self.assets_value_label.configure(text="Verdi av eiendeler (est.): N/A")
+        self.net_worth_label.configure(text="Total Nettoverdi (est.): N/A")
+        self.char_portrait_label.configure(image=None, text="?")
+        self.clear_tree(self.orders_tree)
+        self.clear_tree(self.assets_tree)
+        self.clear_tree(self.trades_tree)
+        self.clear_tree(self.ship_cargo_tree)
+        self.status_label.configure(text="Sesjon utløpt. Logg inn på nytt.")
+
+    # =========================================================================
+    # == DATAHENTING OG PROSESSERING (bruker nå AuthManager for tokens/info)
+    # =========================================================================
 
     def fetch_character_data(self):
-        token = self.get_valid_token()
-        if not token: return
-        response = api.fetch_esi_data("https://esi.evetech.net/verify/?datasource=tranquility", token=token)
-        char_data = response.json() if response else None
-        if char_data and 'CharacterID' in char_data:
-            self.character_info = { 'id': char_data['CharacterID'], 'name': char_data['CharacterName'] }
-            self.char_name_label.configure(text=self.character_info['name'])
-            wallet_response = api.fetch_esi_data(f"https://esi.evetech.net/latest/characters/{self.character_info['id']}/wallet/", token)
-            if wallet_response:
-                self.wallet_balance = float(wallet_response.json())
-                self.wallet_label.configure(text=f"Wallet: {self.wallet_balance:,.2f} ISK")
-            self.fetch_character_portrait()
-            self.fetch_character_orders_threaded()
-            threading.Thread(target=self._fetch_and_update_profit, daemon=True).start()
-            threading.Thread(target=self._fetch_and_display_assets, daemon=True).start()
-            self.fetch_trade_ledger_threaded()
-            self.fetch_active_ship_cargo_threaded()
+        """Hovedfunksjon for å hente all data relatert til en karakter."""
+        # Sjekk om vi kan få tak i karakterinfo. Dette vil også fornye token om nødvendig.
+        if not self.auth_manager.fetch_character_id_and_name():
+            self.update_ui_for_logout()
+            return
+
+        char_info = self.auth_manager.character_info
+        token = self.auth_manager.get_valid_token() # Bør være gyldig nå
+        if not (char_info and token): return
+        
+        # Oppdater UI med grunnleggende info
+        self.char_name_label.configure(text=char_info['name'])
+        
+        # Hent resten av dataen i bakgrunnstråder for å holde UI responsivt
+        wallet_response = api.fetch_esi_data(f"https://esi.evetech.net/latest/characters/{char_info['id']}/wallet/", token)
+        if wallet_response:
+            self.wallet_balance = float(wallet_response.json())
+            self.wallet_label.configure(text=f"Wallet: {self.wallet_balance:,.2f} ISK")
+        
+        self.fetch_character_portrait()
+        self.fetch_character_orders_threaded()
+        threading.Thread(target=self._fetch_and_update_profit, daemon=True).start()
+        threading.Thread(target=self._fetch_and_display_assets, daemon=True).start()
+        self.fetch_trade_ledger_threaded()
+        self.fetch_active_ship_cargo_threaded()
 
     def fetch_character_portrait(self):
-        char_id = self.character_info.get('id')
+        char_id = self.auth_manager.character_info.get('id')
         if not char_id: return
         response = api.fetch_esi_data(f"https://esi.evetech.net/latest/characters/{char_id}/portrait/")
         if response and 'px128x128' in response.json():
@@ -428,27 +468,29 @@ class EveMarketApp(ctk.CTk):
         except (requests.RequestException, TclError): pass
 
     def update_portrait_image(self, photo):
-        try: self.char_portrait_label.configure(image=photo, text="")
+        try:
+            if self.char_portrait_label.winfo_exists():
+                self.char_portrait_label.configure(image=photo, text="")
         except TclError: pass
 
-    def initial_auth_check(self):
-        if self.settings.get("refresh_token") and self.settings.get("esi_client_id"):
-            threading.Thread(target=self.refresh_access_token, daemon=True).start()
-
     def fetch_character_orders_threaded(self):
-        if not self.character_info.get('id'): self.show_error("Du må være innlogget."); return
+        char_id = self.auth_manager.character_info.get('id')
+        if not char_id:
+            self.show_error("Du må være innlogget for å se ordrer.")
+            return
         self.status_label.configure(text="Oppdaterer aktive ordrer...")
         threading.Thread(target=self._fetch_character_orders_logic, daemon=True).start()
 
     def _fetch_character_orders_logic(self):
-        token = self.get_valid_token()
+        token = self.auth_manager.get_valid_token()
         if not token: 
             self.after(0, lambda: self.status_label.configure(text="Sesjon utløpt."))
             return
         
-        char_id = self.character_info['id']
+        char_id = self.auth_manager.character_info['id']
         self.after(0, lambda: self.status_label.configure(text="Henter ordrer, journal og transaksjoner..."))
 
+        # ... (resten av logikken i denne funksjonen er den samme som før)
         orders = api.fetch_character_orders_paginated(char_id, token)
         journal = api.fetch_all_pages(f"https://esi.evetech.net/v6/characters/{char_id}/wallet/journal/", token)
         transactions = api.fetch_all_pages(f"https://esi.evetech.net/v1/characters/{char_id}/wallet/transactions/", token)
@@ -458,8 +500,6 @@ class EveMarketApp(ctk.CTk):
             self.after(0, lambda: self.status_label.configure(text="Klar."))
             return
 
-        # --- NY LOGIKK FOR Å KOBLE AVGIFTER TIL ORDRER VIA TIDSSTEMPLER ---
-        
         unmatched_broker_fees = []
         if journal:
             for entry in journal:
@@ -552,17 +592,17 @@ class EveMarketApp(ctk.CTk):
         self.after(0, lambda: self.status_label.configure(text="Aktive ordrer oppdatert."))
 
     def _fetch_and_update_profit(self):
-        token = self.get_valid_token()
+        token = self.auth_manager.get_valid_token()
         if not token: return
-        transactions = api.fetch_character_transactions_paginated(self.character_info['id'], token)
+        transactions = api.fetch_character_transactions_paginated(self.auth_manager.character_info['id'], token)
         net_profit = calculations.calculate_net_trade_profit(transactions)
         color = "#32a852" if net_profit > 0 else "#c94f4f" if net_profit < 0 else "white"
         self.after(0, lambda: self.profit_label.configure(text=f"Netto handel: {net_profit:,.2f} ISK", text_color=color))
 
     def _fetch_and_display_assets(self):
-        token = self.get_valid_token()
+        token = self.auth_manager.get_valid_token()
         if not token: return
-        all_assets = api.fetch_character_assets_paginated(self.character_info['id'], token)
+        all_assets = api.fetch_character_assets_paginated(self.auth_manager.character_info['id'], token)
         if not all_assets: return
         station_assets = [a for a in all_assets if a.get('location_flag') == 'Hangar']
         type_ids_to_price = list({a['type_id'] for a in station_assets})
@@ -584,6 +624,7 @@ class EveMarketApp(ctk.CTk):
 
     def _update_assets_display(self, grouped_assets, total_value):
         try:
+            if not self.assets_tree.winfo_exists(): return
             self.clear_tree(self.assets_tree)
             for station, items in sorted(grouped_assets.items()):
                 for item in sorted(items, key=lambda x: x['name']):
@@ -593,7 +634,51 @@ class EveMarketApp(ctk.CTk):
             self.assets_value_label.configure(text=f"Verdi av eiendeler (est.): {total_value:,.2f} ISK")
             self.net_worth_label.configure(text=f"Total Nettoverdi (est.): {self.wallet_balance + total_value:,.2f} ISK")
         except TclError: pass
+    
+    # --- Resten av koden forblir stort sett lik, men med AuthManager-kall der det trengs ---
+    # ... (Alle funksjoner for skanning, produksjon, etc. er de samme,
+    #      men vil nå bruke `self.auth_manager.get_valid_token()` ved behov) ...
 
+    def start_galaxy_scan(self):
+        scan_config = self._get_common_scan_config(self.galaxy_min_profit_var, self.galaxy_min_volume_var, self.galaxy_max_investment_var, self.galaxy_ship_cargo_var)
+        if not scan_config: return
+        
+        scan_config.update({
+            "scan_type": "galaxy", 
+            "home_base": self.galaxy_home_base_var.get(), 
+            "target_region": self.galaxy_target_region_var.get(), 
+            "include_structures": self.galaxy_include_structures_var.get(), 
+            "token": self.auth_manager.get_valid_token(),  # BRUKER AUTHMANAGER
+            "settings": self.settings,
+            "include_hisec": self.galaxy_hisec_var.get(),
+            "include_lowsec": self.galaxy_lowsec_var.get(),
+            "include_nullsec": self.galaxy_nullsec_var.get(),
+            "allow_multistation": self.galaxy_multistation_bundle_var.get()
+        })
+        
+        self.clear_tree(self.galaxy_tree)
+        self.run_generic_scan(scan_config)
+
+    def add_user_structure(self):
+        try: structure_id = int(self.new_structure_id_entry.get())
+        except ValueError: self.show_error("Struktur ID må være et tall."); return
+        if any(s.get('id') == structure_id for s in self.settings.get('user_structures', [])):
+            self.show_error("Strukturen er allerede lagt til."); return
+        
+        token = self.auth_manager.get_valid_token() # BRUKER AUTHMANAGER
+        if not token: self.show_error("Du må være innlogget."); return
+        
+        threading.Thread(target=self._add_structure_thread, args=(structure_id, token), daemon=True).start()
+
+    def _open_in_game_market(self, type_id):
+        token = self.auth_manager.get_valid_token() # BRUKER AUTHMANAGER
+        if not token: self.show_error("Du må være innlogget for å bruke denne funksjonen."); return
+        if api.open_market_window_in_game(type_id, token):
+            self.status_label.configure(text=f"Åpner markedsvindu for ID {type_id} i spillet...")
+        else:
+            self.status_label.configure(text="Kunne ikke sende kommando til spillet. Sjekk at du er logget inn i EVE.")
+    
+    # ... (De resterende metodene vil også bli oppdatert til å bruke AuthManager)
     def populate_industry_systems(self):
         if not config.SYSTEM_INDICES_CACHE: api.fetch_industry_system_indices()
         if not config.SYSTEM_INDICES_CACHE: return
@@ -693,26 +778,6 @@ class EveMarketApp(ctk.CTk):
         self.clear_tree(self.region_tree)
         self.run_generic_scan(scan_config)
 
-    def start_galaxy_scan(self):
-        scan_config = self._get_common_scan_config(self.galaxy_min_profit_var, self.galaxy_min_volume_var, self.galaxy_max_investment_var, self.galaxy_ship_cargo_var)
-        if not scan_config: return
-        
-        scan_config.update({
-            "scan_type": "galaxy", 
-            "home_base": self.galaxy_home_base_var.get(), 
-            "target_region": self.galaxy_target_region_var.get(), 
-            "include_structures": self.galaxy_include_structures_var.get(), 
-            "token": self.get_valid_token(), 
-            "settings": self.settings,
-            "include_hisec": self.galaxy_hisec_var.get(),
-            "include_lowsec": self.galaxy_lowsec_var.get(),
-            "include_nullsec": self.galaxy_nullsec_var.get(),
-            "allow_multistation": self.galaxy_multistation_bundle_var.get()
-        })
-        
-        self.clear_tree(self.galaxy_tree)
-        self.run_generic_scan(scan_config)
-        
     def start_bpo_scan(self):
         try:
             scan_config = self._get_common_scan_config(
@@ -791,7 +856,7 @@ class EveMarketApp(ctk.CTk):
         tree_map = {"station": self.scanner_tree, "arbitrage": self.arbitrage_tree, "region_trading": self.region_tree,
                     "galaxy": self.galaxy_tree, "bpo_scanner": self.bpo_tree, "price_hunter": self.price_hunter_tree}
         tree = tree_map.get(scan_type)
-        if not tree: return
+        if not tree or not tree.winfo_exists(): return
         try:
             if scan_type == 'price_hunter':
                 values = (f"{result['price']:,.2f}", f"{result['quantity']:,}", result['location_name'], 
@@ -944,12 +1009,6 @@ class EveMarketApp(ctk.CTk):
         self.status_label.configure(text=f"Pakke med {len(item_lines)} varer kopiert! Lim inn (Ctrl+V) i spillets multibuy-vindu.")
 
     def _on_item_double_click(self, event): pass
-
-    def _open_in_game_market(self, type_id):
-        token = self.get_valid_token()
-        if not token: self.show_error("Du må være innlogget."); return
-        if api.open_market_window_in_game(type_id, token): self.status_label.configure(text="Kommando sendt.")
-        else: self.status_label.configure(text="Kunne ikke sende kommando.")
             
     def _copy_value_to_clipboard(self, value, value_type):
         self.clipboard_clear(); self.clipboard_append(value)
@@ -987,16 +1046,7 @@ class EveMarketApp(ctk.CTk):
         self.clear_tree(self.structures_tree)
         for s in self.settings.get('user_structures', []):
             self.structures_tree.insert("", "end", values=(s.get('name'), s.get('id'), s.get('system_name')))
-
-    def add_user_structure(self):
-        try: structure_id = int(self.new_structure_id_entry.get())
-        except ValueError: self.show_error("Struktur ID må være et tall."); return
-        if any(s.get('id') == structure_id for s in self.settings.get('user_structures', [])):
-            self.show_error("Strukturen er allerede lagt til."); return
-        token = self.get_valid_token()
-        if not token: self.show_error("Du må være innlogget."); return
-        threading.Thread(target=self._add_structure_thread, args=(structure_id, token), daemon=True).start()
-
+    
     def _add_structure_thread(self, structure_id, token):
         details = api.get_structure_details(structure_id, token)
         if not details: self.show_error(f"Kunne ikke hente detaljer for ID {structure_id}."); return
@@ -1015,11 +1065,10 @@ class EveMarketApp(ctk.CTk):
         except (ValueError, IndexError): self.show_error("Kunne ikke slette valgt element.")
         
     def fetch_trade_ledger_threaded(self):
-        if not self.character_info.get('id'):
+        if not self.auth_manager.character_info.get('id'):
             self.show_error("Du må være innlogget for å se handelsloggen.")
             return
-        
-        token = self.get_valid_token()
+        token = self.auth_manager.get_valid_token()
         if not token:
             self.show_error("Sesjonen er utløpt. Logg inn på nytt.")
             return
@@ -1029,8 +1078,8 @@ class EveMarketApp(ctk.CTk):
         threading.Thread(target=self._build_trade_ledger_logic, args=(token,), daemon=True).start()
 
     def _build_trade_ledger_logic(self, token):
-        char_id = self.character_info['id']
-        
+        char_id = self.auth_manager.character_info['id']
+        # ... (resten av funksjonen er lik)
         self.after(0, lambda: self.trade_log_status_label.configure(text="Henter transaksjoner..."))
         transactions = api.fetch_all_pages(f"https://esi.evetech.net/v1/characters/{char_id}/wallet/transactions/", token)
         self.after(0, lambda: self.trade_log_status_label.configure(text="Henter journal..."))
@@ -1090,7 +1139,7 @@ class EveMarketApp(ctk.CTk):
 
     def _update_trade_ledger_display(self, trades):
         self.clear_tree(self.trades_tree)
-        
+        # ... (resten av funksjonen er lik)
         for trade in trades:
             profit = trade['profit']
             tags = ('profit',) if profit > 0 else ('loss',) if profit < 0 else ()
@@ -1112,7 +1161,7 @@ class EveMarketApp(ctk.CTk):
         self.after(0, lambda: self.trade_log_button.configure(state="normal"))
 
     def fetch_active_ship_cargo_threaded(self):
-        token = self.get_valid_token()
+        token = self.auth_manager.get_valid_token()
         if not token:
             self.show_error("Du må være innlogget for å hente skipsdata.")
             return
@@ -1121,7 +1170,8 @@ class EveMarketApp(ctk.CTk):
         threading.Thread(target=self._fetch_active_ship_cargo_logic, args=(token,), daemon=True).start()
 
     def _fetch_active_ship_cargo_logic(self, token):
-        char_id = self.character_info.get('id')
+        char_id = self.auth_manager.character_info.get('id')
+        # ... (resten av funksjonen er lik)
         if not char_id:
             return
             
@@ -1177,6 +1227,7 @@ class EveMarketApp(ctk.CTk):
             })
         self.after(0, self._update_ship_cargo_display, detailed_cargo_list, total_cargo_value, ship_name, ship_type_name)
 
+
     def _update_ship_cargo_display(self, cargo_list, total_value, ship_name, ship_type_name):
         try:
             self.clear_tree(self.ship_cargo_tree)
@@ -1199,18 +1250,26 @@ class EveMarketApp(ctk.CTk):
             pass
 
     def on_closing(self):
+        """Kjøres når applikasjonen lukkes. Stopper tråder og lagrer innstillinger."""
         self.scanning_active.clear()
         if self.scan_thread and self.scan_thread.is_alive():
             self.scan_thread.join(timeout=1.0)
+        
+        # Samle alle innstillinger fra UI-variabler tilbake til settings-objektet
         all_settings = self.settings.copy()
-        for key in self.settings:
-            if hasattr(self, var_name := key + "_var"):
+        for var_attr in dir(self):
+            if var_attr.endswith("_var"):
+                # Trekker ut nøkkelnavnet fra variabelnavnet
+                key_name = var_attr[:-4]
                 try:
-                    if current_value := getattr(self, var_name).get():
-                        all_settings[key] = current_value
+                    current_value = getattr(self, var_attr).get()
+                    all_settings[key_name] = current_value
                 except (TclError, AttributeError):
                     pass
+        
         all_settings['user_structures'] = self.settings.get('user_structures', [])
+        
+        # Lagre de oppdaterte innstillingene
         config.save_settings(all_settings)
         self.destroy()
 
