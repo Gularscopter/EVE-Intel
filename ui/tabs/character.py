@@ -1,160 +1,239 @@
-import customtkinter as ctk
-from tkinter import ttk
-from datetime import datetime, timedelta
+import logging
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QLabel, QPushButton, QGridLayout, 
+                             QHBoxLayout, QTableWidget, QTableWidgetItem, QHeaderView, QTabWidget)
+from PyQt6.QtGui import QPixmap
+from PyQt6.QtCore import Qt, QObject, pyqtSignal, QRunnable, QThreadPool
+import requests
+import api
+import db
+from datetime import datetime, timezone, timedelta
+from collections import defaultdict
 
-def create_tab(tab_frame, app):
-    """
-    Creates the character tab with a modern, clean layout.
-    """
-    # Main grid layout
-    tab_frame.grid_columnconfigure(0, weight=1)
-    tab_frame.grid_rowconfigure(1, weight=1) # Active orders table
-    tab_frame.grid_rowconfigure(2, weight=1) # Trade ledger table
-    tab_frame.grid_rowconfigure(3, weight=1) # Active ship cargo table
+# --- Worker for multi-threading ---
+class WorkerSignals(QObject):
+    finished = pyqtSignal()
+    error = pyqtSignal(Exception)
+    result = pyqtSignal(dict)
 
-    # --- Header & Auth Frame ---
-    header_frame = ctk.CTkFrame(tab_frame, fg_color="transparent")
-    header_frame.grid(row=0, column=0, padx=10, pady=(0, 20), sticky="ew")
-    header_frame.grid_columnconfigure(1, weight=1)
+class Worker(QRunnable):
+    def __init__(self, fn, *args, **kwargs):
+        super().__init__()
+        self.fn = fn; self.args = args; self.kwargs = kwargs; self.signals = WorkerSignals()
+    def run(self):
+        try: self.signals.result.emit(self.fn(*self.args, **self.kwargs))
+        except Exception as e:
+            logging.error("Exception in worker thread", exc_info=True)
+            self.signals.error.emit(e)
+        finally: self.signals.finished.emit()
 
-    # Left side: Login button
-    app.login_button = ctk.CTkButton(header_frame, text="Logg inn med EVE Online", command=app.start_oauth_flow, height=40)
-    app.login_button.grid(row=0, column=0, rowspan=2, padx=0, pady=0, sticky="w")
-    
-    # Center: Character Info
-    char_info_frame = ctk.CTkFrame(header_frame, fg_color="transparent")
-    char_info_frame.grid(row=0, column=1, rowspan=2, padx=20, pady=0, sticky="w")
-    
-    app.char_name_label = ctk.CTkLabel(char_info_frame, text="Ikke innlogget", font=ctk.CTkFont(size=20, weight="bold"))
-    app.char_name_label.pack(anchor="w")
-    
-    app.wallet_label = ctk.CTkLabel(char_info_frame, text="", font=ctk.CTkFont(size=14))
-    app.wallet_label.pack(anchor="w")
-    
-    app.profit_label = ctk.CTkLabel(char_info_frame, text="", font=ctk.CTkFont(size=14, slant="italic"))
-    app.profit_label.pack(anchor="w")
+# --- Main Character Tab Class ---
+class CharacterTab(QWidget):
+    def __init__(self, main_app, parent=None):
+        super().__init__(parent)
+        self.main_app = main_app
+        self.threadpool = QThreadPool()
+        self.worker_data_cache = {}
+        self.init_ui()
 
-    # Right side: Portrait
-    app.char_portrait_label = ctk.CTkLabel(header_frame, text="", width=128, height=128)
-    app.char_portrait_label.grid(row=0, column=2, rowspan=2, padx=0, pady=0, sticky="e")
+    def init_ui(self):
+        main_layout = QVBoxLayout(self)
+        top_section_layout = QHBoxLayout()
+        self.portrait_label = QLabel("Not logged in"); self.portrait_label.setFixedSize(128, 128); self.portrait_label.setAlignment(Qt.AlignmentFlag.AlignCenter); self.portrait_label.setStyleSheet("border: 1px solid grey;")
+        top_section_layout.addWidget(self.portrait_label)
+        info_grid = QGridLayout(); self.name_label = QLabel("<b>Name:</b> N/A"); self.corporation_label = QLabel("<b>Corporation:</b> N/A"); self.location_label = QLabel("<b>Location:</b> N/A"); self.ship_label = QLabel("<b>Current Ship:</b> N/A")
+        info_grid.addWidget(self.name_label, 0, 0); info_grid.addWidget(self.corporation_label, 1, 0); info_grid.addWidget(self.location_label, 0, 1); info_grid.addWidget(self.ship_label, 1, 1)
+        top_section_layout.addLayout(info_grid); top_section_layout.addStretch()
+        button_layout = QVBoxLayout(); self.login_button = QPushButton("Login / Switch Character"); self.login_button.clicked.connect(self.main_app.trigger_full_authentication)
+        self.refresh_button = QPushButton("Refresh Data"); self.refresh_button.clicked.connect(self.load_character_data)
+        button_layout.addWidget(self.login_button); button_layout.addWidget(self.refresh_button); top_section_layout.addLayout(button_layout); main_layout.addLayout(top_section_layout)
+        self.sub_tabs = QTabWidget(); main_layout.addWidget(self.sub_tabs)
+        self.create_summary_tab(); self.create_active_orders_tab(); self.create_transaction_history_tab(); self.create_cargo_tab()
 
-    # --- Active Market Orders Frame ---
-    orders_frame = ctk.CTkFrame(tab_frame, fg_color=("gray92", "gray28"))
-    orders_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=10)
-    orders_frame.grid_columnconfigure(0, weight=1)
-    orders_frame.grid_rowconfigure(1, weight=1)
+    def create_summary_tab(self):
+        summary_widget = QWidget(); layout = QVBoxLayout(summary_widget); layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.wallet_label = QLabel("<h2>Wallet: N/A</h2>"); self.active_sell_orders_label = QLabel("<b>Value of Active Sell Orders:</b> N/A"); self.active_buy_orders_label = QLabel("<b>Escrow in Active Buy Orders:</b> N/A"); self.ship_cargo_label = QLabel("<b>Current Ship Cargo Value:</b> N/A")
+        self.total_sales_label = QLabel("<b>Total Sales:</b> N/A"); self.total_taxes_label = QLabel("<b>Total Taxes Paid:</b> N/A"); self.estimated_profit_label = QLabel("<b>Estimated Profit:</b> N/A")
+        layout.addWidget(self.wallet_label); layout.addWidget(self.active_sell_orders_label); layout.addWidget(self.active_buy_orders_label); layout.addWidget(self.ship_cargo_label)
+        layout.addWidget(QLabel("<hr>")); layout.addWidget(QLabel("<h3>Market Summary (from wallet journal)</h3>")); layout.addWidget(self.total_sales_label); layout.addWidget(self.total_taxes_label); layout.addWidget(self.estimated_profit_label)
+        self.sub_tabs.addTab(summary_widget, "Financial Summary")
 
-    orders_header_frame = ctk.CTkFrame(orders_frame, fg_color="transparent")
-    orders_header_frame.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
-    ctk.CTkLabel(orders_header_frame, text="Aktive Markedsordrer", font=ctk.CTkFont(size=16, weight="bold")).pack(side="left")
-    ctk.CTkButton(orders_header_frame, text="Oppdater", command=app.fetch_character_orders_threaded).pack(side="right")
+    def create_table(self, headers):
+        table = QTableWidget(); table.setColumnCount(len(headers)); table.setHorizontalHeaderLabels(headers); table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers); table.setSortingEnabled(True)
+        return table
 
-    # Treeview for active orders
-    columns = ('item', 'station', 'type', 'buy_price', 'sell_price', 'acc_fees', 'total_value', 'potential_profit', 'volume', 'expires')
-    app.orders_tree = ttk.Treeview(orders_frame, columns=columns, show="headings")
-    headings = {
-        'item': 'Vare', 'station': 'Stasjon', 'type': 'Type', 
-        'buy_price': 'Innkjøpspris', 'sell_price': 'Nåværende Pris', 
-        'acc_fees': 'Akk. Avgifter', 'total_value': 'Gjenv. Verdi',
-        'potential_profit': 'Pot. Profitt', 'volume': 'Volum (Rem/Tot)', 
-        'expires': 'Utløper om'
-    }
-    for col, heading in headings.items():
-        app.orders_tree.heading(col, text=heading, command=lambda c=col: app.sort_results(app.orders_tree, c, False))
+    def create_active_orders_tab(self):
+        headers = ["Vare", "Stasjon", "Type", "Innkjøpspris", "Nåværende Pris", "Akk. Avgifter", "Pot. Profitt", "Utløper om"]
+        self.active_orders_table = self.create_table(headers); self.sub_tabs.addTab(self.active_orders_table, "Aktive Markedsordrer")
+    def create_transaction_history_tab(self):
+        headers = ["Dato", "Vare", "Antall", "Kjøpspris/stk", "Salgspris/stk", "Totale Avgifter", "Reell Netto Profitt"]
+        self.history_table = self.create_table(headers); self.sub_tabs.addTab(self.history_table, "Handelslogg")
+    def create_cargo_tab(self):
+        headers = ["Vare", "Antall", "Jita Pris/stk (Kjøp)", "Totalverdi", "Jita Daglig Volum"]
+        self.cargo_table = self.create_table(headers); self.sub_tabs.addTab(self.cargo_table, "Ship Cargo")
 
-    col_widths = {'item': 220, 'station': 180, 'type': 80, 'buy_price': 110, 'sell_price': 110, 
-                  'acc_fees': 110, 'total_value': 120, 'potential_profit': 120, 'volume': 120, 'expires': 100}
-    for col, width in col_widths.items():
-        app.orders_tree.column(col, width=width, anchor='e' if col not in ['item', 'station', 'type'] else 'w')
-    app.orders_tree.column('type', anchor='center')
-    
-    app.orders_tree.grid(row=1, column=0, sticky="nsew", padx=(1,0), pady=(0,1))
-    orders_scrollbar = ttk.Scrollbar(orders_frame, orient="vertical", command=app.orders_tree.yview)
-    app.orders_tree.configure(yscroll=orders_scrollbar.set)
-    orders_scrollbar.grid(row=1, column=1, sticky="ns", padx=(0,1), pady=(0,1))
-    app.orders_tree.tag_configure('profit', foreground='#4CAF50')
-    app.orders_tree.tag_configure('loss', foreground='#F44336')
-    app.orders_tree.bind("<Button-3>", app._on_tree_right_click)
+    def load_character_data(self):
+        if not self.main_app.character_id: self.clear_all_fields(); return
+        self.refresh_button.setEnabled(False); self.main_app.update_status_bar("Loading character data in background...")
+        worker = Worker(self._fetch_all_data_in_background); worker.signals.result.connect(self._update_ui_with_fetched_data)
+        worker.signals.error.connect(self._on_loading_error); worker.signals.finished.connect(lambda: self.refresh_button.setEnabled(True))
+        self.threadpool.start(worker)
 
+    def _fetch_all_data_in_background(self):
+        char_id, token = self.main_app.character_id, self.main_app.access_token
+        orders = api.get_character_orders(char_id, token); transactions = api.get_character_wallet_transactions(char_id, token)
+        assets = api.get_character_assets_with_names(char_id, token); ship = api.get_character_ship(char_id, token)
+        price_type_ids = set()
+        if orders: price_type_ids.update([o['type_id'] for o in orders])
+        cargo_type_ids = set()
+        if ship and assets:
+            cargo = [a for asset_list in assets.values() for a in asset_list if a.get('location_id') == ship.get('ship_item_id') and a.get('location_flag') == 'Cargo']
+            if cargo:
+                cargo_type_ids = {c['type_id'] for c in cargo}
+                price_type_ids.update(cargo_type_ids)
+        else: cargo = []
+        market_prices = api.get_market_prices(list(price_type_ids)) if price_type_ids else {}
+        market_volumes = api.get_market_history_for_items(list(cargo_type_ids)) if cargo_type_ids else {}
+        return {'details': api.get_character_details(char_id), 'wallet': api.get_character_wallet(char_id, token), 'location': api.get_character_location(char_id, token), 'ship': ship, 'orders': orders, 'transactions': transactions, 'assets': assets, 'cargo': cargo, 'market_prices': market_prices, 'market_volumes': market_volumes, 'journal': api.get_character_wallet_journal(char_id, token)}
 
-    # --- Trade Ledger Frame ---
-    trades_frame = ctk.CTkFrame(tab_frame, fg_color=("gray92", "gray28"))
-    trades_frame.grid(row=2, column=0, sticky="nsew", padx=10, pady=10)
-    trades_frame.grid_columnconfigure(0, weight=1)
-    trades_frame.grid_rowconfigure(1, weight=1)
+    def _on_loading_error(self, e):
+        logging.error(f"Error loading character data: {e}", exc_info=True); self.main_app.log_message(f"Error loading data: {e}")
 
-    trades_header_frame = ctk.CTkFrame(trades_frame, fg_color="transparent")
-    trades_header_frame.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
-    ctk.CTkLabel(trades_header_frame, text="Handelslogg (Siste 50 handler)", font=ctk.CTkFont(size=16, weight="bold")).pack(side="left")
-    app.trade_log_status_label = ctk.CTkLabel(trades_header_frame, text="", font=ctk.CTkFont(size=12, slant="italic"))
-    app.trade_log_status_label.pack(side="left", padx=10)
-    app.trade_log_button = ctk.CTkButton(trades_header_frame, text="Oppdater", command=app.fetch_trade_ledger_threaded)
-    app.trade_log_button.pack(side="right")
+    def _update_ui_with_fetched_data(self, data):
+        self.main_app.update_status_bar("Updating UI..."); self.worker_data_cache = data
+        if data.get('details'):
+            self.name_label.setText(f"<b>Name:</b> {data['details'].get('name', 'N/A')}"); self.corporation_label.setText(f"<b>Corporation:</b> {data['details'].get('corporation_name', 'N/A')}"); self.load_character_portrait()
+        if data.get('wallet') is not None: self.wallet_label.setText(f"<h2>Wallet: {data['wallet']:,.2f} ISK</h2>")
+        if data.get('location'):
+            loc_names = api.get_location_names({data['location']['solar_system_id']}, self.main_app.access_token, self.main_app.character_id)
+            self.location_label.setText(f"<b>Location:</b> {loc_names.get(data['location']['solar_system_id'], 'Unknown')}")
+        if data.get('ship'):
+            ship_type = db.get_item_name(data['ship']['ship_type_id']) or "Unknown"; self.ship_label.setText(f"<b>Current Ship:</b> {data['ship']['ship_name']} ({ship_type})")
+        self._update_active_orders(); self._update_trade_log(); self._update_ship_cargo(); self.main_app.update_status_bar("Character data updated.")
 
-    # Treeview for trade ledger
-    trade_cols = ('date', 'item', 'quantity', 'buy_price', 'sell_price', 'fees', 'profit')
-    app.trades_tree = ttk.Treeview(trades_frame, columns=trade_cols, show="headings")
-    trade_headings = {
-        'date': 'Dato', 'item': 'Vare', 'quantity': 'Antall', 
-        'buy_price': 'Kjøpspris/stk', 'sell_price': 'Salgspris/stk', 
-        'fees': 'Totale Avgifter', 'profit': 'Reell Netto Profitt'
-    }
-    for col, heading in trade_headings.items():
-        app.trades_tree.heading(col, text=heading, command=lambda c=col: app.sort_results(app.trades_tree, c, False))
+    def _update_active_orders(self):
+        orders = self.worker_data_cache.get('orders', []); market_prices = self.worker_data_cache.get('market_prices', {})
+        transactions = self.worker_data_cache.get('transactions', []); journal = self.worker_data_cache.get('journal', [])
+        self.active_orders_table.setRowCount(0); total_sell, total_buy = 0, 0
+        if not orders: return
+        loc_ids = {o['location_id'] for o in orders}; loc_names = api.get_location_names(loc_ids, self.main_app.access_token, self.main_app.character_id)
+        
+        buy_transactions = {t['type_id']: t['unit_price'] for t in transactions if t.get('is_buy')}
+        journal_fees = {entry.get('order_id'): abs(entry.get('amount', 0)) for entry in journal if entry.get('ref_type') in ['brokers_fee', 'transaction_tax'] and 'order_id' in entry}
 
-    trade_col_widths = {'date': 150, 'item': 250, 'quantity': 100, 'buy_price': 150, 
-                        'sell_price': 150, 'fees': 150, 'profit': 150}
-    for col, width in trade_col_widths.items():
-        app.trades_tree.column(col, width=width, anchor='e' if col not in ['date', 'item'] else 'w')
+        for o in orders:
+            row = self.active_orders_table.rowCount(); self.active_orders_table.insertRow(row)
+            is_buy = o.get('is_buy_order', False); type_id = o.get('type_id'); price_info = market_prices.get(type_id, {})
+            current_price = price_info.get('buy' if is_buy else 'sell', 0)
+            
+            purchase_price = 0; profit = 0
+            purchase_price_str = "N/A"
+            fees = journal_fees.get(o.get('order_id'), 0)
 
-    app.trades_tree.grid(row=1, column=0, sticky="nsew", padx=(1,0), pady=(0,1))
-    trades_scrollbar = ttk.Scrollbar(trades_frame, orient="vertical", command=app.trades_tree.yview)
-    app.trades_tree.configure(yscroll=trades_scrollbar.set)
-    trades_scrollbar.grid(row=1, column=1, sticky="ns", padx=(0,1), pady=(0,1))
-    app.trades_tree.tag_configure('profit', foreground='#4CAF50')
-    app.trades_tree.tag_configure('loss', foreground='#F44336')
+            if not is_buy:
+                purchase_price = buy_transactions.get(type_id, 0)
+                if purchase_price > 0:
+                    purchase_price_str = f"{purchase_price:,.2f}"
+                    profit = (o['price'] - purchase_price) * o['volume_remain']
+                else:
+                    profit = (o['price'] - current_price) * o['volume_remain']
+            else:
+                profit = (current_price - o['price']) * o['volume_remain']
 
-    # --- Active Ship Cargo Frame ---
-    cargo_frame = ctk.CTkFrame(tab_frame, fg_color=("gray92", "gray28"))
-    cargo_frame.grid(row=3, column=0, sticky="nsew", padx=10, pady=10)
-    cargo_frame.grid_columnconfigure(0, weight=1)
-    cargo_frame.grid_rowconfigure(1, weight=1)
+            issued = datetime.fromisoformat(o['issued'].replace('Z', '+00:00')); expires = issued + timedelta(days=o['duration'])
+            expires_in = expires - datetime.now(timezone.utc); expires_str = f"{expires_in.days}d {expires_in.seconds//3600}h" if expires_in.days >= 0 else "Expired"
+            if is_buy: total_buy += o.get('escrow', 0)
+            else: total_sell += o.get('price', 0) * o.get('volume_remain', 0)
+            
+            self.active_orders_table.setItem(row, 0, QTableWidgetItem(db.get_item_name(type_id)))
+            self.active_orders_table.setItem(row, 1, QTableWidgetItem(loc_names.get(o['location_id'])))
+            self.active_orders_table.setItem(row, 2, QTableWidgetItem("Kjøp" if is_buy else "Salg"))
+            self.active_orders_table.setItem(row, 3, QTableWidgetItem(purchase_price_str))
+            self.active_orders_table.setItem(row, 4, QTableWidgetItem(f"{o['price']:,.2f}"))
+            self.active_orders_table.setItem(row, 5, QTableWidgetItem(f"{fees:,.2f}"))
+            self.active_orders_table.setItem(row, 6, QTableWidgetItem(f"{profit:,.2f}"))
+            self.active_orders_table.setItem(row, 7, QTableWidgetItem(expires_str))
+        self.active_sell_orders_label.setText(f"<b>Value of Active Sell Orders:</b> {total_sell:,.2f} ISK"); self.active_buy_orders_label.setText(f"<b>Escrow in Active Buy Orders:</b> {total_buy:,.2f} ISK")
 
-    cargo_header_frame = ctk.CTkFrame(cargo_frame, fg_color="transparent")
-    cargo_header_frame.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
-    
-    app.ship_name_label = ctk.CTkLabel(cargo_header_frame, text="Aktivt Skip / Last", font=ctk.CTkFont(size=16, weight="bold"))
-    app.ship_name_label.pack(side="left")
+    def _calculate_trade_log(self, transactions, journal):
+        buys = [t for t in transactions if t.get('is_buy')]; sells = [t for t in transactions if not t.get('is_buy')]
+        buys_by_item = defaultdict(list); sells_by_item = defaultdict(list)
+        for b in buys: buys_by_item[b['type_id']].append(b)
+        for s in sells: sells_by_item[s['type_id']].append(s)
+        for item_id in buys_by_item: buys_by_item[item_id].sort(key=lambda x: x['date'])
+        for item_id in sells_by_item: sells_by_item[item_id].sort(key=lambda x: x['date'])
+        trade_log = []; total_profit, total_fees = 0, 0
+        journal_fees = {entry['transaction_id']: abs(entry.get('amount', 0)) for entry in journal if 'transaction_id' in entry and entry.get('ref_type') in ['brokers_fee', 'transaction_tax']}
+        for item_id, sales in sells_by_item.items():
+            if item_id not in buys_by_item: continue
+            buy_list = buys_by_item[item_id][:]
+            for sale in sales:
+                sale_quantity_to_match = sale['quantity']; sale_price = sale['unit_price']; cost_of_goods_sold = 0; temp_buy_list = []
+                last_buy = None
+                fees_for_this_trade = journal_fees.get(sale['transaction_id'], 0)
+                for buy in buy_list:
+                    if sale_quantity_to_match == 0: temp_buy_list.append(buy); continue
+                    last_buy = buy; buy_quantity = buy['quantity']; buy_price = buy['unit_price']
+                    if buy_quantity >= sale_quantity_to_match:
+                        cost_of_goods_sold += sale_quantity_to_match * buy_price; buy['quantity'] -= sale_quantity_to_match
+                        if buy['quantity'] > 0: temp_buy_list.append(buy)
+                        if last_buy: fees_for_this_trade += journal_fees.get(last_buy.get('transaction_id',-1), 0)
+                        sale_quantity_to_match = 0
+                    else:
+                        cost_of_goods_sold += buy_quantity * buy_price; sale_quantity_to_match -= buy_quantity
+                        if last_buy: fees_for_this_trade += journal_fees.get(last_buy.get('transaction_id',-1), 0)
+                buy_list = temp_buy_list
+                if cost_of_goods_sold > 0:
+                    sale_revenue = sale['quantity'] * sale_price
+                    net_profit = sale_revenue - cost_of_goods_sold - fees_for_this_trade
+                    total_profit += net_profit; total_fees += fees_for_this_trade
+                    trade_log.append({'date': sale['date'], 'type_id': item_id, 'quantity': sale['quantity'], 'buy_price': cost_of_goods_sold / sale['quantity'], 'sell_price': sale_price, 'profit': net_profit, 'fees': fees_for_this_trade})
+        summary = {'total_sales': sum(s['unit_price']*s['quantity'] for s in sells), 'total_taxes': total_fees, 'estimated_profit': total_profit}
+        return sorted(trade_log, key=lambda x: x['date'], reverse=True), summary
 
-    app.ship_cargo_status_label = ctk.CTkLabel(cargo_header_frame, text="", font=ctk.CTkFont(size=12, slant="italic"))
-    app.ship_cargo_status_label.pack(side="left", padx=10)
-    
-    app.update_cargo_button = ctk.CTkButton(cargo_header_frame, text="Oppdater Last", command=app.fetch_active_ship_cargo_threaded)
-    app.update_cargo_button.pack(side="right")
+    def _update_trade_log(self):
+        transactions = self.worker_data_cache.get('transactions', []); journal = self.worker_data_cache.get('journal', [])
+        self.history_table.setRowCount(0)
+        if not transactions or not journal: return
+        trade_log, summary = self._calculate_trade_log(transactions, journal)
+        for trade in trade_log:
+            row = self.history_table.rowCount(); self.history_table.insertRow(row)
+            date = datetime.fromisoformat(trade['date'].replace('Z', '+00:00')).strftime('%Y-%m-%d %H:%M')
+            self.history_table.setItem(row, 0, QTableWidgetItem(date)); self.history_table.setItem(row, 1, QTableWidgetItem(db.get_item_name(trade['type_id'])))
+            self.history_table.setItem(row, 2, QTableWidgetItem(f"{trade['quantity']:,}")); self.history_table.setItem(row, 3, QTableWidgetItem(f"{trade['buy_price']:,.2f}"))
+            self.history_table.setItem(row, 4, QTableWidgetItem(f"{trade['sell_price']:,.2f}")); self.history_table.setItem(row, 5, QTableWidgetItem(f"{trade.get('fees', 0):,.2f}")); self.history_table.setItem(row, 6, QTableWidgetItem(f"{trade['profit']:,.2f}"))
+        self.total_sales_label.setText(f"<b>Total Sales:</b> {summary['total_sales']:,.2f} ISK"); self.total_taxes_label.setText(f"<b>Total Taxes Paid:</b> {summary['total_taxes']:,.2f} ISK")
+        self.estimated_profit_label.setText(f"<b>Estimated Profit:</b> {summary['estimated_profit']:,.2f} ISK"); self.estimated_profit_label.setStyleSheet("color: green;" if summary['estimated_profit'] > 0 else "color: red;")
 
-    # Treeview for ship cargo
-    cargo_cols = ('item', 'quantity', 'jita_price', 'total_value', 'jita_volume')
-    app.ship_cargo_tree = ttk.Treeview(cargo_frame, columns=cargo_cols, show="headings")
-    cargo_headings = {
-        'item': 'Vare', 'quantity': 'Antall', 
-        'jita_price': 'Jita Pris/stk (Kjøp)', 'total_value': 'Totalverdi', 
-        'jita_volume': 'Jita Daglig Volum'
-    }
-    for col, heading in cargo_headings.items():
-        app.ship_cargo_tree.heading(col, text=heading, command=lambda c=col: app.sort_results(app.ship_cargo_tree, c, False))
+    def _update_ship_cargo(self):
+        market_prices = self.worker_data_cache.get('market_prices', {}); cargo = self.worker_data_cache.get('cargo', []); market_volumes = self.worker_data_cache.get('market_volumes', {})
+        self.cargo_table.setRowCount(0); total_value = 0
+        if not cargo: self.clear_cargo_fields(); return
+        for item in cargo:
+            row = self.cargo_table.rowCount(); self.cargo_table.insertRow(row)
+            type_id = item.get('type_id'); price_info = market_prices.get(type_id, {});
+            buy_price = price_info.get('buy', 0); daily_volume = market_volumes.get(type_id, 0)
+            value = buy_price * item.get('quantity', 0); total_value += value
+            self.cargo_table.setItem(row, 0, QTableWidgetItem(item.get('name', 'Unknown')))
+            self.cargo_table.setItem(row, 1, QTableWidgetItem(f"{item.get('quantity', 0):,}")); 
+            self.cargo_table.setItem(row, 2, QTableWidgetItem(f"{buy_price:,.2f}"))
+            self.cargo_table.setItem(row, 3, QTableWidgetItem(f"{value:,.2f}")); 
+            self.cargo_table.setItem(row, 4, QTableWidgetItem(f"{daily_volume:,}"))
+        self.ship_cargo_label.setText(f"<b>Current Ship Cargo Value:</b> {total_value:,.2f} ISK")
 
-    app.ship_cargo_tree.column('item', width=250, anchor='w')
-    app.ship_cargo_tree.column('quantity', width=120, anchor='e')
-    app.ship_cargo_tree.column('jita_price', width=180, anchor='e')
-    app.ship_cargo_tree.column('total_value', width=180, anchor='e')
-    app.ship_cargo_tree.column('jita_volume', width=180, anchor='e')
-    
-    app.ship_cargo_tree.grid(row=1, column=0, sticky="nsew", padx=(1,0), pady=(0,1))
-    cargo_scrollbar = ttk.Scrollbar(cargo_frame, orient="vertical", command=app.ship_cargo_tree.yview)
-    app.ship_cargo_tree.configure(yscroll=cargo_scrollbar.set)
-    cargo_scrollbar.grid(row=1, column=1, sticky="ns", padx=(0,1), pady=(0,1))
-    app.ship_cargo_tree.bind("<Button-3>", app._on_tree_right_click)
+    def clear_all_fields(self):
+        self.portrait_label.setText("Not logged in"); self.portrait_label.setPixmap(QPixmap()); self.name_label.setText("<b>Name:</b> N/A"); self.corporation_label.setText("<b>Corporation:</b> N/A"); self.location_label.setText("<b>Location:</b> N/A"); self.ship_label.setText("<b>Current Ship:</b> N/A")
+        self.wallet_label.setText("<h2>Wallet: N/A</h2>"); self.active_sell_orders_label.setText("<b>Value of Active Sell Orders:</b> N/A"); self.active_buy_orders_label.setText("<b>Escrow in Active Buy Orders:</b> N/A"); self.clear_cargo_fields()
+        self.total_sales_label.setText("<b>Total Sales:</b> N/A"); self.total_taxes_label.setText("<b>Total Taxes Paid:</b> N/A"); self.estimated_profit_label.setText("<b>Estimated Profit:</b> N/A"); self.estimated_profit_label.setStyleSheet("")
+        self.active_orders_table.setRowCount(0); self.history_table.setRowCount(0)
+        
+    def clear_cargo_fields(self):
+        self.ship_cargo_label.setText("<b>Current Ship Cargo Value:</b> 0.00 ISK"); self.cargo_table.setRowCount(0)
 
-    # Total value label
-    app.ship_cargo_value_label = ctk.CTkLabel(cargo_frame, text="Totalverdi i last (est.): 0.00 ISK", font=ctk.CTkFont(size=14, weight="bold"))
-    app.ship_cargo_value_label.grid(row=2, column=0, sticky="e", padx=10, pady=5)
+    def load_character_portrait(self):
+        try:
+            url = f"https://images.evetech.net/characters/{self.main_app.character_id}/portrait?size=128"
+            response = requests.get(url, stream=True)
+            if response.status_code == 200: pixmap = QPixmap(); pixmap.loadFromData(response.content); self.portrait_label.setPixmap(pixmap)
+        except Exception as e:
+            logging.error(f"Could not load character portrait: {e}")

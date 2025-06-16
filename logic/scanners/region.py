@@ -1,74 +1,98 @@
-import time
+import logging
+from collections import defaultdict
 import api
-import config
-from .helpers import get_trend_indicator, format_time
+import db
+from .helpers import get_trend_indicator # Importerer nå fra den gjenopprettede filen
 
-def run_region_trading_scan(scan_config, all_type_ids, progress_callback):
-    """Kjører 'flipping'-skann innad på én stasjon."""
-    id_to_name = {v: k for k, v in config.ITEM_NAME_TO_ID.items()}
-    scan_type = scan_config['scan_type']
-    active_flag = scan_config['active_flag']
-    base_progress = 0.1
+def find_best_trades_in_region(region_name, min_profit, min_margin, status_callback):
+    """
+    Finds the best station-to-station trades within a single region.
+    """
+    status_callback(f"Resolving region ID for '{region_name}'...")
+    # We need a station in the region to find the region_id. This is a limitation of the API design.
+    # We'll try to find a major trade hub in that region if possible.
+    # This is a bit of a hack. A better way would be a local region name -> ID map.
     
-    station_info = config.STATIONS_INFO[scan_config['station']]
-    item_chunks = [all_type_ids[i:i + 200] for i in range(0, len(all_type_ids), 200)]
+    # A robust way to get region_id from region_name is not straightforward via ESI.
+    # This part of the logic needs to be improved, maybe with a static map.
+    # For now, we will assume a direct lookup is possible IF we can find a station.
+    # Let's try to find the region ID from a known station if it's a hub name.
+    hubs = {"The Forge": "Jita IV - Moon 4 - Caldari Navy Assembly Plant"}
+    station_name_for_region = hubs.get(region_name)
     
-    progress_callback({'scan_type': scan_type, 'progress': base_progress, 'status': f"Steg 1: Henter priser for {scan_config['station']}..."})
-    prices_map = {}
-    for i, chunk in enumerate(item_chunks):
-        if not active_flag.is_set(): return
-        progress = base_progress + (i / len(item_chunks) * 0.4)
-        progress_callback({'scan_type': scan_type, 'progress': progress, 'status': f"Henter pris-gruppe {i+1}/{len(item_chunks)}..."})
-        data = api.fetch_fuzzwork_market_data(station_info['id'], chunk)
-        for typeid_str, item_data in (data or {}).items():
-            prices_map[int(typeid_str)] = item_data
-        time.sleep(0.5)
+    if not station_name_for_region:
+        raise ValueError(f"Cannot determine a station to find the region ID for '{region_name}'. This feature is limited to major hubs for now.")
 
-    progress_callback({'scan_type': scan_type, 'progress': 0.5, 'status': "Steg 2: Finner kandidater..."})
-    candidates = []
-    for type_id in all_type_ids:
-        item_data = prices_map.get(type_id)
-        if not item_data or not item_data.get('buy') or not item_data.get('sell'): continue
-        if float(item_data['buy']['max']) > 0 and float(item_data['sell']['min']) > float(item_data['buy']['max']):
-            candidates.append(type_id)
+    station_id = api.resolve_name_to_id(station_name_for_region, 'station')
+    station_details = api.get_station_details(station_id)
+    if not station_details:
+        raise ValueError(f"Could not fetch details for station '{station_name_for_region}'")
+    
+    region_id = station_details['region_id']
+    status_callback(f"Region ID {region_id} found. Fetching all market orders...")
 
-    total_candidates, start_time = len(candidates), time.time()
-    for i, type_id in enumerate(candidates):
-        if not active_flag.is_set(): break
-        item_name = id_to_name.get(type_id, f"ID: {type_id}")
-        progress = 0.5 + ((i + 1) / total_candidates * 0.5) if total_candidates > 0 else 1
-        eta = (total_candidates - (i + 1)) * ((time.time() - start_time) / (i + 1)) if i > 0 else None
-        progress_callback({'scan_type': scan_type, 'progress': progress, 'status': f"Sjekker finalist {i+1}/{total_candidates}: {item_name}", 'eta': f"ETA: {format_time(eta)}"})
+    all_orders = []
+    page = 1
+    while True:
+        status_callback(f"Fetching market orders page {page}...")
+        orders = api.get_market_orders(region_id, "all", page)
+        if not orders:
+            break
+        all_orders.extend(orders)
+        page += 1
+
+    status_callback("Analyzing buy and sell orders...")
+    buy_orders = defaultdict(list)
+    sell_orders = defaultdict(list)
+
+    for order in all_orders:
+        if order.get('is_buy_order'):
+            buy_orders[order['type_id']].append(order)
+        else:
+            sell_orders[order['type_id']].append(order)
+
+    profitable_deals = []
+    common_items = set(buy_orders.keys()) & set(sell_orders.keys())
+    status_callback(f"Found {len(common_items)} common items. Calculating profits...")
+
+    for i, item_id in enumerate(common_items):
+        if i > 0 and i % 50 == 0:
+            status_callback(f"Analyzing item {i+1}/{len(common_items)}...")
+
+        # Find best buy (highest price) and best sell (lowest price) in the region
+        best_buy_order = max(buy_orders[item_id], key=lambda x: x['price'])
+        best_sell_order = min(sell_orders[item_id], key=lambda x: x['price'])
+
+        profit = best_sell_order['price'] - best_buy_order['price']
+
+        if profit < min_profit:
+            continue
         
-        history = api.fetch_esi_history(station_info['region_id'], type_id)
-        avg_daily_vol = sum(h['volume'] for h in history[-7:]) / 7 if history and len(history) >= 7 else 0
-        if avg_daily_vol < scan_config['min_volume']: continue
+        margin = (profit / best_buy_order['price']) * 100 if best_buy_order['price'] > 0 else 0
         
+        if margin < min_margin:
+            continue
+
+        # Get extra details
+        history = api.get_item_price_history(region_id, item_id)
         trend = get_trend_indicator(history)
-        orders_data = api.fetch_market_orders(station_info['region_id'], type_id)
-        if not orders_data: continue
         
-        highest_buy = max((o for o in orders_data if o['location_id'] == station_info['id'] and o['is_buy_order']), key=lambda x: x['price'], default=None)
-        lowest_sell = min((o for o in orders_data if o['location_id'] == station_info['id'] and not o['is_buy_order']), key=lambda x: x['price'], default=None)
-        if not highest_buy or not lowest_sell: continue
+        daily_volume = history[-1]['volume'] if history else 0
+        volume_str = f"{daily_volume:,}" if daily_volume > 0 else "N/A"
+        
+        buy_station_details = api.get_station_details(best_buy_order['location_id'])
+        sell_station_details = api.get_station_details(best_sell_order['location_id'])
 
-        # Beregn antall konkurrenter
-        comp_buy = sum(1 for o in orders_data if o['location_id'] == station_info['id'] and o['is_buy_order'] and o['price'] >= highest_buy['price'])
-        comp_sell = sum(1 for o in orders_data if o['location_id'] == station_info['id'] and not o['is_buy_order'] and o['price'] <= lowest_sell['price'])
-        
-        buy_price = highest_buy['price'] + 0.01
-        sell_price = lowest_sell['price'] - 0.01
-        if buy_price >= sell_price: continue
-        
-        fees = (buy_price * (scan_config['brokers_fee_rate'] / 100)) + (sell_price * (scan_config['brokers_fee_rate'] / 100)) + (sell_price * (scan_config['sales_tax_rate'] / 100))
-        net_profit = (sell_price - buy_price) - fees
-        
-        if net_profit < scan_config['min_profit'] or buy_price > scan_config['max_investment']: continue
-        
-        result = {
-            'item': item_name, 'profit_per_unit': net_profit, 'profit_margin': (net_profit / buy_price) * 100 if buy_price > 0 else 0,
-            'daily_volume': avg_daily_vol, 'buy_price': buy_price, 'sell_price': sell_price, 'trend': trend, 'competition': f"{comp_buy} / {comp_sell}"
-        }
-        progress_callback({'scan_type': 'region_trading', 'result': result})
+        profitable_deals.append({
+            'item_name': db.get_item_name(item_id) or f"Item ID {item_id}",
+            'buy_station': buy_station_details['name'] if buy_station_details else 'Unknown Station',
+            'sell_station': sell_station_details['name'] if sell_station_details else 'Unknown Station',
+            'profit': profit,
+            'margin': margin,
+            'volume_str': f"{trend} {volume_str}",
+            'price': best_sell_order['price']
+        })
 
-    progress_callback({'scan_type': scan_type, 'status': 'Stasjonshandel-skann fullført!'})
+    profitable_deals.sort(key=lambda x: x['profit'], reverse=True)
+    status_callback("Region scan complete.")
+    return profitable_deals

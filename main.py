@@ -1,26 +1,28 @@
-# ==============================================================================
-# EVE MARKET VERKTØY - HOVEDFIL
-# ==============================================================================
 import sys
-# ENDRET IMPORT-LINJE:
+import logging
+from PyQt6.QtWidgets import QApplication
 from ui.main_app import EveMarketApp
-from config import load_items_from_file, load_settings
+import config
 
 def main():
-    """
-    Hovedfunksjon for å starte EVE Market Verktøy.
-    Laster inn nødvendige data og starter GUI-loopen.
-    """
-    # 1. Last inn kritiske varedata. Avslutt hvis det feiler.
-    if not load_items_from_file():
-        sys.exit(1)
+    """Hovedfunksjon for å starte applikasjonen."""
+    # Sett opp logging for å fange feil og informasjon
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    
+    # Last inn konfigurasjonen fra app_config.json
+    # Funksjonen i config.py kjøres automatisk når den importeres,
+    # men vi kan kalle den eksplisitt her for klarhetens skyld.
+    config.load_config()
 
-    # 2. Last inn lagrede innstillinger fra config-filen.
-    app_settings = load_settings()
+    # Opprett Qt-applikasjonen
+    app = QApplication(sys.argv)
+    
+    # Opprett og vis hovedvinduet
+    window = EveMarketApp()
+    window.show()
+    
+    # Start applikasjonens event-loop
+    sys.exit(app.exec())
 
-    # 3. Opprett og kjør applikasjonen.
-    app = EveMarketApp(settings_dict=app_settings)
-    app.mainloop()
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

@@ -1,288 +1,203 @@
-# ==============================================================================
-# EVE MARKET VERKTØY - API-MODUL
-# ==============================================================================
 import requests
+import logging
+import db
 import config
 import time
-import db 
+from collections import defaultdict
 
-def fetch_blueprint_details(type_id):
-    """
-    Henter blueprint-detaljer fra den lokale SDE-databasen via db-modulen.
-    """
-    return db.get_blueprint_from_sde(type_id)
+ESI_BASE_URL = "https://esi.evetech.net/latest"
+LOGIN_BASE_URL = "https://login.eveonline.com"
+FUZZWORK_API_URL = "https://market.fuzzwork.co.uk/aggregates/"
 
-def fetch_industry_system_indices():
-    if config.SYSTEM_INDICES_CACHE:
-        return config.SYSTEM_INDICES_CACHE
+_name_cache = {}
+_station_details_cache = {}
+CACHE_TIMEOUT_SECONDS = 3600 # 1 hour
+
+def get_character_id(access_token):
+    headers = {"Authorization": f"Bearer {access_token}"}
+    url = f"{LOGIN_BASE_URL}/oauth/verify"
+    try:
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        return response.json().get("CharacterID")
+    except requests.exceptions.RequestException as e:
+        error_text = e.response.text if e.response else "No response from server"
+        logging.error(f"Failed to verify token. Status: {e.response.status_code if e.response else 'N/A'}. Response: {error_text}")
+        return None
+
+def get_market_prices(type_ids, station_id=60003760):
+    """
+    OPTIMIZED: Fetches only buy/sell prices from Fuzzwork. This is very fast.
+    """
+    if not type_ids: return {}
+    unique_type_ids = list(set(type_ids))
+    prices = defaultdict(lambda: {'buy': 0, 'sell': 0})
     
-    url = "https://esi.evetech.net/latest/industry/systems/?datasource=tranquility"
-    response = fetch_esi_data(url)
-    data = response.json() if response else None
+    chunk_size = 200
+    id_chunks = [unique_type_ids[i:i + chunk_size] for i in range(0, len(unique_type_ids), chunk_size)]
     
-    if data:
-        for system_data in data:
-            config.SYSTEM_INDICES_CACHE[system_data['solar_system_id']] = system_data
-        return config.SYSTEM_INDICES_CACHE
+    for chunk in id_chunks:
+        try:
+            params = {'station': station_id, 'types': ",".join(map(str, chunk))}
+            response = requests.get(FUZZWORK_API_URL, params=params)
+            response.raise_for_status()
+            market_data = response.json()
+            for type_id_str, data in market_data.items():
+                type_id = int(type_id_str)
+                prices[type_id]['buy'] = float(data.get('buy', {}).get('max', 0))
+                prices[type_id]['sell'] = float(data.get('sell', {}).get('min', 0))
+        except (requests.exceptions.RequestException, KeyError, ValueError) as e:
+            logging.error(f"Failed to get or parse prices from Fuzzwork API for a chunk: {e}")
+            
+    return prices
+
+def get_market_history_for_items(type_ids, region_id=10000002):
+    """
+    SLOW: Fetches historical daily volume from ESI. To be used sparingly.
+    """
+    if not type_ids: return {}
+    unique_type_ids = list(set(type_ids))
+    volumes = {}
+    
+    for i, type_id in enumerate(unique_type_ids):
+        if i > 0 and i % 50 == 0: logging.info(f"Fetching market history {i+1}/{len(unique_type_ids)}...")
+        history = get_item_price_history(region_id, type_id)
+        if history and isinstance(history, list) and len(history) > 0:
+            volumes[type_id] = history[-1].get('volume', 0)
+        else:
+            volumes[type_id] = 0
+            
+    return volumes
+
+def get_character_wallet_journal(character_id, access_token):
+    headers = {"Authorization": f"Bearer {access_token}"}; url = f"{ESI_BASE_URL}/characters/{character_id}/wallet/journal/"; journal_entries = []; page = 1
+    while True:
+        try:
+            response = requests.get(url, headers=headers, params={'page': page})
+            if response.status_code != 200: break
+            data = response.json()
+            if not data: break
+            journal_entries.extend(data); page += 1
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Failed to get wallet journal page {page}: {e}"); break
+    return journal_entries
+
+def get_character_wallet_transactions(character_id, access_token):
+    headers = {"Authorization": f"Bearer {access_token}"}; url = f"{ESI_BASE_URL}/characters/{character_id}/wallet/transactions/"; transactions = []
+    try:
+        response = requests.get(url, headers=headers, params={'page': 1})
+        response.raise_for_status()
+        data = response.json()
+        if data: transactions.extend(data)
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Failed to get wallet transactions for character {character_id}: {e}")
+    return transactions
+
+def get_character_location(character_id, access_token):
+    headers = {"Authorization": f"Bearer {access_token}"}; url = f"{ESI_BASE_URL}/characters/{character_id}/location/"
+    try: response = requests.get(url, headers=headers); response.raise_for_status(); return response.json()
+    except requests.exceptions.RequestException: return None
+
+def get_character_ship(character_id, access_token):
+    headers = {"Authorization": f"Bearer {access_token}"}; url = f"{ESI_BASE_URL}/characters/{character_id}/ship/"
+    try: response = requests.get(url, headers=headers); response.raise_for_status(); return response.json()
+    except requests.exceptions.RequestException: return None
+
+def get_character_orders(character_id, access_token):
+    headers = {"Authorization": f"Bearer {access_token}"}; url = f"{ESI_BASE_URL}/characters/{character_id}/orders/"
+    try: response = requests.get(url, headers=headers); response.raise_for_status(); return response.json()
+    except requests.exceptions.RequestException: return []
+
+def get_market_orders(region_id, order_type="all", page=1):
+    params = {"order_type": order_type, "page": page}
+    try:
+        response = requests.get(f"{ESI_BASE_URL}/markets/{region_id}/orders/", params=params)
+        if response.status_code == 404: return []
+        response.raise_for_status(); return response.json()
+    except requests.exceptions.RequestException: return []
+
+def resolve_name_to_id(name, category=None):
+    now = time.time()
+    if name in _name_cache and (now - _name_cache[name]['timestamp']) < CACHE_TIMEOUT_SECONDS: return _name_cache[name]['data'].get('id')
+    try:
+        response = requests.post(f"{ESI_BASE_URL}/universe/ids/", json=[name]); response.raise_for_status(); data = response.json()
+        if category:
+            key = category + 's'
+            if key in data and data[key]: result = data[key][0]; _name_cache[name] = {'timestamp': now, 'data': result}; return result.get('id')
+        for cat_key, entries in data.items():
+            if entries: result = entries[0]; _name_cache[name] = {'timestamp': now, 'data': result}; return result.get('id')
+        return None
+    except requests.exceptions.RequestException: return None
+
+def get_station_details(station_id):
+    now = time.time()
+    if station_id in _station_details_cache and (now - _station_details_cache[station_id]['timestamp']) < CACHE_TIMEOUT_SECONDS: return _station_details_cache[station_id]['data']
+    try:
+        station_response = requests.get(f"{ESI_BASE_URL}/universe/stations/{station_id}/"); station_response.raise_for_status(); station_data = station_response.json()
+        system_response = requests.get(f"{ESI_BASE_URL}/universe/systems/{station_data['system_id']}/"); system_response.raise_for_status()
+        constellation_id = system_response.json()['constellation_id']
+        constellation_response = requests.get(f"{ESI_BASE_URL}/universe/constellations/{constellation_id}/"); constellation_response.raise_for_status()
+        region_id = constellation_response.json()['region_id']
+        details = {'id': station_id, 'name': station_data['name'], 'system_id': station_data['system_id'], 'region_id': region_id}
+        _station_details_cache[station_id] = {'timestamp': now, 'data': details}
+        return details
+    except requests.exceptions.RequestException: return None
+
+def get_character_name(character_id):
+    response = requests.get(f"{ESI_BASE_URL}/characters/{character_id}/"); return response.json()["name"] if response.status_code == 200 else "Unknown"
+
+def get_character_details(character_id):
+    response = requests.get(f"{ESI_BASE_URL}/characters/{character_id}/")
+    if response.status_code == 200:
+        data = response.json(); corp_id, alliance_id = data.get('corporation_id'), data.get('alliance_id')
+        if corp_id: data['corporation_name'] = get_corp_name(corp_id)
+        if alliance_id: data['alliance_name'] = get_alliance_name(alliance_id)
+        return data
     return None
 
-def fetch_esi_data(url, token=None, page=None):
-    headers = {'User-Agent': config.USER_AGENT}
-    params = {}
-    if token:
-        headers['Authorization'] = f"Bearer {token}"
-    if page:
-        params['page'] = page
-        
-    try:
-        response = requests.get(url, headers=headers, params=params, timeout=10)
-        response.raise_for_status()
-        return response
-    except requests.RequestException as e:
-        print(f"ESI request failed for {url}: {e}")
-        return None
+def get_corp_name(corp_id):
+    response = requests.get(f"{ESI_BASE_URL}/corporations/{corp_id}/"); return response.json().get('name', 'N/A') if response.status_code == 200 else 'N/A'
+def get_alliance_name(alliance_id):
+    response = requests.get(f"{ESI_BASE_URL}/alliances/{alliance_id}/"); return response.json().get('name', 'N/A') if response.status_code == 200 else 'N/A'
 
-def fetch_all_pages(url, token=None): ### ENDRET: token er valgfri
-    all_results = []
-    current_page = 1
-    total_pages = 1
+def get_character_wallet(character_id, access_token):
+    headers = {"Authorization": f"Bearer {access_token}"}
+    response = requests.get(f"{ESI_BASE_URL}/characters/{character_id}/wallet/", headers=headers); return response.json() if response.status_code == 200 else None
 
-    while current_page <= total_pages:
-        response = fetch_esi_data(url, token=token, page=current_page)
-        if not response:
-            break
+def get_character_assets_with_names(character_id, access_token):
+    headers = {"Authorization": f"Bearer {access_token}"}; assets = []; page = 1
+    while True:
+        response = requests.get(f"{ESI_BASE_URL}/characters/{character_id}/assets/?page={page}", headers=headers)
+        if response.status_code != 200: break
+        data = response.json();
+        if not data: break
+        assets.extend(data); page += 1
+    type_ids = list(set([asset['type_id'] for asset in assets])); item_names = db.get_item_names(type_ids)
+    location_ids = list(set([asset['location_id'] for asset in assets])); location_names = get_location_names(location_ids, access_token, character_id)
+    for asset in assets:
+        asset['name'] = item_names.get(asset['type_id'], 'Unknown Item'); asset['volume'] = db.get_item_volume(asset['type_id']) or 0.0
+        asset['location_name'] = location_names.get(asset['location_id'], 'Unknown Location')
+    assets_by_location = defaultdict(list)
+    for asset in assets:
+        assets_by_location[asset['location_name']].append(asset)
+    return assets_by_location
 
-        data = response.json()
-        if not data:
-            break
-        all_results.extend(data)
+def get_location_names(location_ids, access_token, character_id):
+    if isinstance(location_ids, set): location_ids = list(location_ids)
+    headers = {"Authorization": f"Bearer {access_token}"}; names = {}
+    id_chunks = [location_ids[i:i + 1000] for i in range(0, len(location_ids), 1000)]
+    for chunk in id_chunks:
+        try:
+            response = requests.post(f"{ESI_BASE_URL}/universe/names/", json=list(set(chunk)))
+            if response.status_code == 200:
+                for item in response.json(): names[item['id']] = item['name']
+        except Exception as e: logging.error(f"Failed to get names for chunk: {e}")
+    for loc_id in location_ids:
+        if loc_id not in names:
+            if loc_id == character_id: names[loc_id] = "Asset Safety"
+            else: names[loc_id] = f"Unknown Location ({loc_id})"
+    return names
 
-        if current_page == 1:
-            total_pages = int(response.headers.get('x-pages', 1))
-        
-        current_page += 1
-        
-    return all_results
-
-### NY ###
-def fetch_structure_market_orders(structure_id, token):
-    """
-    Henter alle markedsordrer fra en spesifikk, brukereid stasjon.
-    Krever autentisering og at karakteren har docking-tilgang.
-    """
-    if not token:
-        print("Token mangler for å hente data fra structure.")
-        return None
-        
-    url = f"https://esi.evetech.net/latest/markets/structures/{structure_id}/"
-    return fetch_all_pages(url, token)
-
-### NY ###
-def get_structure_details(structure_id, token):
-    """Henter nøkkeldetaljer for en spesifikk struktur."""
-    url = f"https://esi.evetech.net/latest/universe/structures/{structure_id}/?datasource=tranquility"
-    response = fetch_esi_data(url, token=token)
-    if not response:
-        return None
-        
-    data = response.json()
-    system_id = data.get('solar_system_id')
-    if not system_id:
-        return None
-
-    system_name = db.get_system_name_from_sde(system_id)
-    region_id = db.get_region_for_system(system_id)
-
-    return {
-        "name": data.get('name', 'Ukjent Navn'),
-        "system_id": system_id,
-        "system_name": system_name,
-        "region_id": region_id
-    }
-
-def fetch_character_orders_paginated(character_id, token):
-    url = f"https://esi.evetech.net/v1/characters/{character_id}/orders/"
-    return fetch_all_pages(url, token)
-
-def fetch_character_transactions_paginated(character_id, token):
-    url = f"https://esi.evetech.net/v1/characters/{character_id}/wallet/transactions/"
-    return fetch_all_pages(url, token)
-
-def fetch_character_assets_paginated(character_id, token):
-    url = f"https://esi.evetech.net/v5/characters/{character_id}/assets/"
-    return fetch_all_pages(url, token)
-
-# ==============================================================================
-# === NY FUNKSJON FOR SKIPSLAST ===
-# ==============================================================================
-def fetch_character_ship(character_id, token):
-    """Henter informasjon om spillerens aktive skip."""
-    url = f"https://esi.evetech.net/v2/characters/{character_id}/ship/"
-    response = fetch_esi_data(url, token=token)
-    return response.json() if response else None
-# ==============================================================================
-
-def open_market_window_in_game(type_id, token):
-    url = "https://esi.evetech.net/v1/ui/openwindow/marketdetails/"
-    params = {'type_id': type_id}
-    headers = {
-        'User-Agent': config.USER_AGENT,
-        'Authorization': f"Bearer {token}"
-    }
-    try:
-        response = requests.post(url, headers=headers, params=params, timeout=10)
-        response.raise_for_status()
-        return True
-    except requests.RequestException as e:
-        print(f"ESI UI request failed: {e}")
-        return False
-
-def fetch_tokens_from_code(client_id, secret_key, code):
-    url = "https://login.eveonline.com/v2/oauth/token"
-    headers = {'Content-Type': 'application/x-www-form-urlencoded', 'Host': 'login.eveonline.com'}
-    data = {'grant_type': 'authorization_code', 'code': code}
-    
-    try:
-        response = requests.post(url, headers=headers, data=data, auth=(client_id, secret_key))
-        response.raise_for_status()
-        return response.json()
-    except requests.RequestException:
-        return None
-
-def refresh_esi_tokens(client_id, secret_key, refresh_token):
-    url = "https://login.eveonline.com/v2/oauth/token"
-    headers = {'Content-Type': 'application/x-www-form-urlencoded', 'Host': 'login.eveonline.com'}
-    data = {'grant_type': 'refresh_token', 'refresh_token': refresh_token}
-
-    try:
-        response = requests.post(url, headers=headers, data=data, auth=(client_id, secret_key))
-        response.raise_for_status()
-        return response.json()
-    except requests.RequestException:
-        return None
-
-def fetch_market_orders(region_id, type_id):
-    url = f"https://esi.evetech.net/latest/markets/{region_id}/orders/?datasource=tranquility&type_id={type_id}"
-    response = fetch_esi_data(url)
-    return response.json() if response else None
-
-def fetch_esi_history(region_id, type_id):
-    url = f"https://esi.evetech.net/latest/markets/{region_id}/history/?datasource=tranquility&type_id={type_id}"
-    response = fetch_esi_data(url)
-    return response.json() if response else None
-
-def fetch_type_attributes(type_id):
-    if type_id in config.TYPE_ATTRIBUTES_CACHE: 
-        return config.TYPE_ATTRIBUTES_CACHE[type_id]
-    
-    name_from_sde = db.get_type_name_from_sde(type_id)
-    if not name_from_sde.startswith("Ukjent"):
-        url = f"https://esi.evetech.net/latest/universe/types/{type_id}/?datasource=tranquility"
-        response = fetch_esi_data(url)
-        data = response.json() if response else None
-        if data: 
-            config.TYPE_ATTRIBUTES_CACHE[type_id] = data
-        return data
-        
-    url = f"https://esi.evetech.net/latest/universe/types/{type_id}/?datasource=tranquility"
-    response = fetch_esi_data(url)
-    data = response.json() if response else None
-    if data: 
-        config.TYPE_ATTRIBUTES_CACHE[type_id] = data
-    return data
-
-def fetch_fuzzwork_market_data(station_id, type_ids):
-    url = "https://market.fuzzwork.co.uk/aggregates/"
-    params = {'station': station_id, 'types': ",".join(map(str, type_ids))}
-    headers = {'User-Agent': config.USER_AGENT}
-    try:
-        response = requests.get(url, params=params, headers=headers, timeout=20)
-        response.raise_for_status()
-        return response.json()
-    except requests.RequestException:
-        return {}
-
-def populate_all_regions_cache():
-    if config.ALL_REGIONS_CACHE: return
-
-    response = fetch_esi_data("https://esi.evetech.net/latest/universe/regions/")
-    if not response: return
-    region_ids = response.json()
-
-    k_space_region_ids = [rid for rid in region_ids if str(rid).startswith('10')]
-    for region_id in k_space_region_ids:
-        region_response = fetch_esi_data(f"https://esi.evetech.net/latest/universe/regions/{region_id}/")
-        if region_response:
-            region_data = region_response.json()
-            if region_data and 'name' in region_data:
-                config.ALL_REGIONS_CACHE[region_data['name']] = region_id
-
-### ENDRET ###
-def get_station_name_with_cache(location_id):
-    """
-    Henter navnet på en lokasjon (stasjon eller struktur) med cache.
-    Prøver først som stasjon, deretter som struktur.
-    """
-    if location_id in config.STATION_CACHE: 
-        return config.STATION_CACHE[location_id]
-    
-    # Sjekk om det er en pre-definert hub
-    for name, info in config.STATIONS_INFO.items():
-        if info['id'] == location_id:
-            config.STATION_CACHE[location_id] = name
-            return name
-            
-    # Forsøk å hente som NPC-stasjon først
-    station_url = f"https://esi.evetech.net/latest/universe/stations/{location_id}/"
-    response = fetch_esi_data(station_url)
-    if response:
-        data = response.json()
-        if data and 'name' in data:
-            name = data['name']
-            config.STATION_CACHE[location_id] = name
-            return name
-            
-    # Hvis det feilet, forsøk å hente som brukereid stasjon
-    # Dette krever token, som vi ikke har universell tilgang til her.
-    # Vi stoler derfor på at navnet er cachet fra et annet sted (f.eks. asset-listen)
-    # ELLER at brukeren legger det til manuelt.
-    # For robusthet, kaller vi ikke ESI her, men en bedre app ville sendt token.
-    # Fallback:
-    name_not_found = f"Lokasjon ID: {location_id}"
-    config.STATION_CACHE[location_id] = name_not_found
-    return name_not_found
-
-def get_stations_in_region(region_id):
-    major_hubs_in_region = {}
-    for station_name, station_info in config.STATIONS_INFO.items():
-        if station_info['region_id'] == region_id:
-            major_hubs_in_region[station_info['id']] = station_name
-    
-    if major_hubs_in_region:
-        print(f"Fokusert skann: Fant {len(major_hubs_in_region)} handelshub(er) i region {region_id}.")
-        return major_hubs_in_region
-
-    print(f"Dypt skann: Ingen kjente huber funnet i region {region_id}. Starter fullt stasjonssøk...")
-    systems_url = f"https://esi.evetech.net/latest/universe/regions/{region_id}/"
-    region_response = fetch_esi_data(systems_url)
-    if not region_response: return {}
-    
-    region_data = region_response.json()
-    if not region_data or 'systems' not in region_data: return {}
-
-    all_stations = {}
-    systems_in_region = region_data.get('systems', [])
-    
-    for system_id in systems_in_region:
-        system_response = fetch_esi_data(f"https://esi.evetech.net/latest/universe/systems/{system_id}/")
-        if system_response:
-            system_data = system_response.json()
-            if system_data and 'stations' in system_data:
-                for station_id in system_data['stations']:
-                    station_info = get_station_name_with_cache(station_id)
-                    if station_info != str(station_id): 
-                        all_stations[station_id] = station_info
-        
-        time.sleep(0.05)
-        
-    return all_stations
+def get_item_price_history(region_id, type_id):
+    try: response = requests.get(f"{ESI_BASE_URL}/markets/{region_id}/history/?type_id={type_id}"); response.raise_for_status(); return response.json()
+    except requests.RequestException: return None

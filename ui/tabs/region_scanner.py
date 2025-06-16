@@ -1,78 +1,85 @@
-import customtkinter as ctk
-from tkinter import ttk
-import config
+import logging
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
+                             QLineEdit, QTableWidget, QHeaderView,
+                             QTableWidgetItem, QLabel, QSpinBox, QDoubleSpinBox)
+from logic.scanners.region import find_best_trades_in_region
 
-def create_tab(tab_frame, app):
-    """
-    Creates the region/station trading scanner tab with a modern layout.
-    """
-    tab_frame.grid_columnconfigure(0, weight=1)
-    tab_frame.grid_rowconfigure(2, weight=1)
+class RegionScannerTab(QWidget):
+    def __init__(self, main_app, parent=None):
+        super().__init__(parent)
+        self.main_app = main_app
+        self.init_ui()
 
-    # --- Header ---
-    header_frame = ctk.CTkFrame(tab_frame, fg_color="transparent")
-    header_frame.grid(row=0, column=0, padx=10, pady=(0, 20), sticky="ew")
-    ctk.CTkLabel(header_frame, text="Stasjonshandel (Flipping)", font=ctk.CTkFont(size=24, weight="bold")).pack(anchor="w")
+    def init_ui(self):
+        layout = QVBoxLayout(self)
 
-    # --- Settings Frame ---
-    settings_frame = ctk.CTkFrame(tab_frame, fg_color=("gray92", "gray28"))
-    settings_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=10)
-    for i in range(4): settings_frame.grid_columnconfigure(i, weight=1)
+        # Controls
+        controls_layout = QHBoxLayout()
+        self.region_name_input = QLineEdit()
+        self.region_name_input.setPlaceholderText("Region Name (e.g., The Forge)")
+        
+        self.min_profit_input = QSpinBox()
+        self.min_profit_input.setRange(0, 1_000_000_000)
+        self.min_profit_input.setSingleStep(10000)
+        self.min_profit_input.setValue(100000)
 
-    # Column 0: Station
-    ctk.CTkLabel(settings_frame, text="Handelshub").grid(row=0, column=0, padx=10, pady=5)
-    station_names = list(config.STATIONS_INFO.keys())
-    ctk.CTkComboBox(settings_frame, variable=app.region_station_var, values=station_names, state="readonly").grid(row=1, column=0, padx=10, pady=5, sticky="ew")
-    
-    # Column 1: Filters
-    ctk.CTkLabel(settings_frame, text="Min. profitt/enhet").grid(row=0, column=1, padx=10, pady=5)
-    ctk.CTkEntry(settings_frame, textvariable=app.region_min_profit_var).grid(row=1, column=1, padx=10, pady=5, sticky="ew")
-    ctk.CTkLabel(settings_frame, text="Min. daglig volum").grid(row=2, column=1, padx=10, pady=5)
-    ctk.CTkEntry(settings_frame, textvariable=app.region_min_volume_var).grid(row=3, column=1, padx=10, pady=5, sticky="ew")
+        self.min_margin_input = QDoubleSpinBox()
+        self.min_margin_input.setRange(0, 1000)
+        self.min_margin_input.setSingleStep(1)
+        self.min_margin_input.setValue(10)
+        
+        self.scan_region_button = QPushButton("Scan Region")
+        self.scan_region_button.clicked.connect(self.run_region_scan)
 
-    # Column 2: Investment
-    ctk.CTkLabel(settings_frame, text="Maks. investering").grid(row=0, column=2, padx=10, pady=5)
-    ctk.CTkEntry(settings_frame, textvariable=app.region_max_investment_var).grid(row=1, column=2, padx=10, pady=5, sticky="ew")
+        controls_layout.addWidget(QLabel("Region:"))
+        controls_layout.addWidget(self.region_name_input)
+        controls_layout.addWidget(QLabel("Min Profit:"))
+        controls_layout.addWidget(self.min_profit_input)
+        controls_layout.addWidget(QLabel("Min Margin (%):"))
+        controls_layout.addWidget(self.min_margin_input)
+        controls_layout.addWidget(self.scan_region_button)
+        layout.addLayout(controls_layout)
 
-    # Column 3: Controls
-    button_frame = ctk.CTkFrame(settings_frame, fg_color="transparent")
-    button_frame.grid(row=1, column=3, rowspan=2)
-    app.region_scan_button = ctk.CTkButton(button_frame, text="Start Skann", command=app.start_region_scan, height=40)
-    app.region_scan_button.pack(pady=5)
-    app.region_stop_button = ctk.CTkButton(button_frame, text="Stopp", command=app.stop_scan, state="disabled", height=30, fg_color="#D32F2F", hover_color="#B71C1C")
-    app.region_stop_button.pack(pady=5)
+        # Results table
+        self.region_deals_table = QTableWidget()
+        self.region_deals_table.setColumnCount(7)
+        self.region_deals_table.setHorizontalHeaderLabels([
+            "Item Name", "Buy Station", "Sell Station", "Profit", "Margin (%)",
+            "Daily Volume", "Price"
+        ])
+        self.region_deals_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.region_deals_table.setSortingEnabled(True)
+        layout.addWidget(self.region_deals_table)
 
-    # Progress Bar
-    progress_frame = ctk.CTkFrame(settings_frame, fg_color="transparent")
-    progress_frame.grid(row=4, column=0, columnspan=4, sticky="ew", pady=10)
-    progress_frame.grid_columnconfigure(0, weight=1)
-    app.region_progress = ctk.CTkProgressBar(progress_frame)
-    app.region_progress.set(0)
-    app.region_progress.grid(row=0, column=0, sticky="ew", padx=10)
-    app.region_scan_details_label = ctk.CTkLabel(progress_frame, text="")
-    app.region_scan_details_label.grid(row=0, column=1, padx=10)
+    def run_region_scan(self):
+        region_name = self.region_name_input.text()
+        min_profit = self.min_profit_input.value()
+        min_margin = self.min_margin_input.value()
 
-    # --- Result Frame ---
-    result_frame = ctk.CTkFrame(tab_frame, fg_color=("gray92", "gray28"))
-    result_frame.grid(row=2, column=0, sticky="nsew", padx=10, pady=10)
-    result_frame.grid_columnconfigure(0, weight=1)
-    result_frame.grid_rowconfigure(0, weight=1)
-    
-    columns = ('item', 'profit_unit', 'margin', 'daily_vol', 'buy_price', 'sell_price', 'competition', 'trend')
-    app.region_tree = ttk.Treeview(result_frame, columns=columns, show="headings")
-    headings = {'item':'Vare', 'profit_unit':'Profitt/enhet', 'margin':'Margin %', 'daily_vol':'Daglig Volum', 'buy_price':'Kjøpspris', 'sell_price':'Salgspris', 'competition':'Konkurrenter', 'trend':'Trend'}
-    for col, text in headings.items():
-        app.region_tree.heading(col, text=text, command=lambda c=col: app.sort_results(app.region_tree, c, False))
+        if not region_name:
+            self.main_app.update_status_bar("Error: Region name is required.")
+            return
 
-    app.region_tree.column('item', anchor='w', width=250)
-    for col in columns[1:]: app.region_tree.column(col, anchor='e', width=120)
-    
-    app.region_tree.tag_configure('golden_deal', background='#6a5101')
-    app.region_tree.tag_configure('excellent_deal', background='#1B5E20')
-    app.region_tree.tag_configure('good_deal', background='#2E7D32')
+        self.main_app.update_status_bar(f"Scanning {region_name}... This may take a moment.")
+        
+        try:
+            # Pass the status update callback to the scanner function
+            deals = find_best_trades_in_region(region_name, min_profit, min_margin, self.main_app.update_status_bar)
+            self.display_region_deals(deals)
+            self.main_app.update_status_bar("Region scan complete.")
+        except Exception as e:
+            logging.error(f"Error in region scan: {e}", exc_info=True)
+            self.main_app.log_message(f"Region Scan Error: {e}")
 
-    app.region_tree.grid(row=0, column=0, sticky="nsew", padx=(1,0), pady=1)
-    scrollbar = ttk.Scrollbar(result_frame, orient="vertical", command=app.region_tree.yview)
-    app.region_tree.configure(yscroll=scrollbar.set)
-    scrollbar.grid(row=0, column=1, sticky="ns", padx=(0,1), pady=1)
-    app.region_tree.bind("<Button-3>", app._on_tree_right_click)
+    def display_region_deals(self, deals):
+        self.region_deals_table.setRowCount(0)
+        for deal in deals:
+            row = self.region_deals_table.rowCount()
+            self.region_deals_table.insertRow(row)
+            self.region_deals_table.setItem(row, 0, QTableWidgetItem(deal['item_name']))
+            self.region_deals_table.setItem(row, 1, QTableWidgetItem(deal['buy_station']))
+            self.region_deals_table.setItem(row, 2, QTableWidgetItem(deal['sell_station']))
+            self.region_deals_table.setItem(row, 3, QTableWidgetItem(f"{deal['profit']:,.2f} ISK"))
+            self.region_deals_table.setItem(row, 4, QTableWidgetItem(f"{deal['margin']:.2f}%"))
+            self.region_deals_table.setItem(row, 5, QTableWidgetItem(f"{deal['volume_str']}"))
+            self.region_deals_table.setItem(row, 6, QTableWidgetItem(f"{deal['price']:,.2f} ISK"))

@@ -1,62 +1,87 @@
-import customtkinter as ctk
-from tkinter import ttk
+import logging
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QPushButton, QTreeWidget, QTreeWidgetItem,
+                             QHeaderView, QLineEdit, QHBoxLayout, QLabel)
+from PyQt6.QtCore import Qt
+from api import get_character_assets_with_names
 
-def create_tab(tab, app):
-    """
-    Creates the assets tab with a modern, clean layout.
-    """
-    # Configure grid layout
-    tab.grid_columnconfigure(0, weight=1)
-    tab.grid_rowconfigure(1, weight=1)
-    
-    # --- Header Frame ---
-    header_frame = ctk.CTkFrame(tab, fg_color="transparent")
-    header_frame.grid(row=0, column=0, padx=10, pady=(0, 20), sticky="ew")
-    header_frame.grid_columnconfigure(0, weight=1)
+class AssetsTab(QWidget):
+    def __init__(self, main_app, parent=None):
+        super().__init__(parent)
+        self.main_app = main_app
+        self.init_ui()
 
-    title_label = ctk.CTkLabel(header_frame, text="Mine Eiendeler", font=ctk.CTkFont(size=24, weight="bold"))
-    title_label.grid(row=0, column=0, sticky="w")
+    def init_ui(self):
+        layout = QVBoxLayout(self)
 
-    # --- Summary Frame for key values ---
-    summary_frame = ctk.CTkFrame(tab, fg_color=("gray92", "gray28"))
-    summary_frame.grid(row=0, column=1, padx=10, pady=(0, 20), sticky="e")
-    
-    app.assets_value_label = ctk.CTkLabel(summary_frame, text="Verdi: Henter...", font=ctk.CTkFont(size=16))
-    app.assets_value_label.pack(side="left", padx=15, pady=10)
-    
-    app.net_worth_label = ctk.CTkLabel(summary_frame, text="Nettoverdi: Henter...", font=ctk.CTkFont(size=16, weight="bold"))
-    app.net_worth_label.pack(side="left", padx=15, pady=10)
+        # Top controls
+        controls_layout = QHBoxLayout()
+        self.refresh_button = QPushButton("Refresh Assets")
+        self.refresh_button.clicked.connect(self.load_assets)
+        self.filter_input = QLineEdit()
+        self.filter_input.setPlaceholderText("Filter by item name or location...")
+        self.filter_input.textChanged.connect(self.filter_assets)
+        
+        controls_layout.addWidget(self.refresh_button)
+        controls_layout.addWidget(QLabel("Filter:"))
+        controls_layout.addWidget(self.filter_input)
+        layout.addLayout(controls_layout)
 
-    # --- Treeview Frame for the list of assets ---
-    result_frame = ctk.CTkFrame(tab, fg_color=("gray92", "gray28"))
-    result_frame.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=10, pady=0)
-    result_frame.grid_columnconfigure(0, weight=1)
-    result_frame.grid_rowconfigure(0, weight=1)
+        # Tree widget for assets
+        self.assets_tree = QTreeWidget()
+        self.assets_tree.setColumnCount(4)
+        self.assets_tree.setHeaderLabels(["Item Name", "Location", "Quantity", "Volume (m³)"])
+        self.assets_tree.header().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.assets_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive) # Allow resizing for name
+        layout.addWidget(self.assets_tree)
 
-    # Define columns and headings for the Treeview
-    columns = ('station', 'item', 'quantity', 'price', 'total_value')
-    app.assets_tree = ttk.Treeview(result_frame, columns=columns, show="headings")
-    
-    headings = {
-        'station': 'Stasjon', 'item': 'Vare', 'quantity': 'Antall', 
-        'price': 'Pris/stk (est.)', 'total_value': 'Totalverdi (est.)'
-    }
-    
-    for col, heading in headings.items():
-        app.assets_tree.heading(col, text=heading, command=lambda c=col: app.sort_results(app.assets_tree, c, False))
+    def load_assets(self):
+        self.main_app.update_status_bar("Loading assets...")
+        self.assets_tree.clear()
+        
+        if not self.main_app.character_id or not self.main_app.access_token:
+            self.main_app.log_message("Cannot load assets: Not authenticated.")
+            return
 
-    # Configure column properties
-    app.assets_tree.column('station', anchor="w", width=300)
-    app.assets_tree.column('item', anchor="w", width=300)
-    app.assets_tree.column('quantity', anchor="e", width=120)
-    app.assets_tree.column('price', anchor="e", width=150)
-    app.assets_tree.column('total_value', anchor="e", width=150)
+        try:
+            assets_by_location = get_character_assets_with_names(self.main_app.character_id, self.main_app.access_token)
+            
+            for location_name, assets in assets_by_location.items():
+                location_item = QTreeWidgetItem(self.assets_tree, [location_name])
+                location_item.setExpanded(False) # Start collapsed
+                
+                for asset in assets:
+                    asset_item = QTreeWidgetItem(location_item)
+                    asset_item.setText(0, asset.get('name', 'Unknown Item'))
+                    asset_item.setText(1, location_name) # Hide location for children for cleaner view
+                    asset_item.setText(2, str(asset.get('quantity', 'N/A')))
+                    asset_item.setText(3, f"{asset.get('volume', 0):.2f}")
 
-    # Place the Treeview and its scrollbar
-    app.assets_tree.grid(row=0, column=0, sticky="nsew", padx=(1,0), pady=1)
-    scrollbar = ttk.Scrollbar(result_frame, orient="vertical", command=app.assets_tree.yview)
-    app.assets_tree.configure(yscroll=scrollbar.set)
-    scrollbar.grid(row=0, column=1, sticky="ns", padx=(0,1), pady=1)
+            self.main_app.update_status_bar("Assets loaded successfully.")
+        except Exception as e:
+            logging.error(f"Error loading assets: {e}", exc_info=True)
+            self.main_app.log_message(f"Failed to load assets: {e}")
 
-    # Bind right-click event
-    app.assets_tree.bind("<Button-3>", app._on_tree_right_click)
+    def filter_assets(self, text):
+        search_text = text.lower()
+        for i in range(self.assets_tree.topLevelItemCount()):
+            location_item = self.assets_tree.topLevelItem(i)
+            location_name_matches = search_text in location_item.text(0).lower()
+            
+            child_matches = False
+            for j in range(location_item.childCount()):
+                child_item = location_item.child(j)
+                item_name_matches = search_text in child_item.text(0).lower()
+                if item_name_matches:
+                    child_item.setHidden(False)
+                    child_matches = True
+                else:
+                    child_item.setHidden(True)
+            
+            # Hide location if no children match, unless the location name itself matches
+            if not child_matches and not location_name_matches:
+                location_item.setHidden(True)
+            else:
+                location_item.setHidden(False)
+                # If there are matching children, ensure the parent is expanded
+                if child_matches:
+                    location_item.setExpanded(True)

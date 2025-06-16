@@ -1,59 +1,136 @@
-import customtkinter as ctk
-from tkinter import ttk
+import logging
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
+                             QLineEdit, QTableWidget, QHeaderView,
+                             QTableWidgetItem, QLabel)
+from PyQt6.QtCore import Qt
+from logic.scanners.price_hunter import find_best_deals
+from ui.components.item_detail_window import ItemDetailWindow
 
-def create_tab(tab_frame, app):
-    """
-    Creates the price hunter tab with a modern layout.
-    """
-    tab_frame.grid_columnconfigure(0, weight=1)
-    tab_frame.grid_rowconfigure(2, weight=1)
+class PriceHunterTab(QWidget):
+    def __init__(self, main_app, parent=None):
+        super().__init__(parent)
+        self.main_app = main_app
+        self.item_detail_window = None # To hold reference to the detail window
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+
+        # Top controls
+        controls_layout = QHBoxLayout()
+        self.start_station_input = QLineEdit()
+        self.start_station_input.setPlaceholderText("Start Station (e.g., Jita IV - Moon 4...)")
+        self.end_station_input = QLineEdit()
+        self.end_station_input.setPlaceholderText("End Station (e.g., Amarr VIII...)")
+        self.volume_input = QLineEdit()
+        self.volume_input.setPlaceholderText("Max Volume (m³)")
+        self.tax_input = QLineEdit()
+        self.tax_input.setPlaceholderText("Tax Rate (%)")
+        self.search_button = QPushButton("Search Best Deals")
+        self.search_button.clicked.connect(self.run_price_hunter)
+
+        controls_layout.addWidget(QLabel("Start:"))
+        controls_layout.addWidget(self.start_station_input)
+        controls_layout.addWidget(QLabel("End:"))
+        controls_layout.addWidget(self.end_station_input)
+        controls_layout.addWidget(QLabel("Volume:"))
+        controls_layout.addWidget(self.volume_input)
+        controls_layout.addWidget(QLabel("Tax:"))
+        controls_layout.addWidget(self.tax_input)
+        controls_layout.addWidget(self.search_button)
+
+        layout.addLayout(controls_layout)
+
+        # Table for results
+        self.deals_table = QTableWidget()
+        self.deals_table.setColumnCount(9)
+        self.deals_table.setHorizontalHeaderLabels([
+            "Item Name", "Buy Station", "Buy Price", "Sell Station", "Sell Price",
+            "Profit per Unit", "Volume", "Profit per Jump", "Margin (%)"
+        ])
+        self.deals_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.deals_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        self.deals_table.setSortingEnabled(True)
+        self.deals_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.deals_table.itemDoubleClicked.connect(self.show_item_details)
+        layout.addWidget(self.deals_table)
+
+    def run_price_hunter(self):
+        start_station = self.start_station_input.text()
+        end_station = self.end_station_input.text()
+        
+        try:
+            max_volume = float(self.volume_input.text()) if self.volume_input.text() else float('inf')
+            tax_rate = float(self.tax_input.text()) if self.tax_input.text() else 0.0
+        except ValueError:
+            self.main_app.update_status_bar("Error: Volume and Tax must be numbers.")
+            return
+
+        if not start_station or not end_station:
+            self.main_app.update_status_bar("Error: Start and End stations are required.")
+            return
+
+        self.main_app.update_status_bar("Searching for best deals... This might take a while.")
+        
+        try:
+            # The find_best_deals function needs a callback to update the status bar
+            deals = find_best_deals(start_station, end_station, max_volume, tax_rate, self.main_app.update_status_bar)
+            self.display_deals(deals)
+            self.main_app.update_status_bar("Search complete.")
+        except Exception as e:
+            logging.error(f"Error in price hunter: {e}", exc_info=True)
+            self.main_app.update_status_bar(f"Error: {e}")
+
+    def display_deals(self, deals):
+        self.deals_table.setRowCount(0)
+        for deal in deals:
+            row_position = self.deals_table.rowCount()
+            self.deals_table.insertRow(row_position)
+            
+            # Store item_id in the first column's data role
+            item_name_item = QTableWidgetItem(deal['item_name'])
+            item_name_item.setData(Qt.ItemDataRole.UserRole, deal['item_id'])
+
+            buy_price_item = QTableWidgetItem()
+            buy_price_item.setData(Qt.ItemDataRole.DisplayRole, f"{deal['buy_price']:,.2f} ISK")
+            
+            sell_price_item = QTableWidgetItem()
+            sell_price_item.setData(Qt.ItemDataRole.DisplayRole, f"{deal['sell_price']:,.2f} ISK")
+
+            profit_item = QTableWidgetItem()
+            profit_item.setData(Qt.ItemDataRole.DisplayRole, f"{deal['profit_per_unit']:,.2f} ISK")
+            
+            volume_item = QTableWidgetItem()
+            volume_item.setData(Qt.ItemDataRole.DisplayRole, f"{deal['volume']:.2f} m³")
+
+            profit_jump_item = QTableWidgetItem()
+            profit_jump_item.setData(Qt.ItemDataRole.DisplayRole, f"{deal['profit_per_jump']:,.2f} ISK")
+
+            margin_item = QTableWidgetItem()
+            margin_item.setData(Qt.ItemDataRole.DisplayRole, f"{deal['margin']:.2f}%")
+
+
+            self.deals_table.setItem(row_position, 0, item_name_item)
+            self.deals_table.setItem(row_position, 1, QTableWidgetItem(deal['buy_station']))
+            self.deals_table.setItem(row_position, 2, buy_price_item)
+            self.deals_table.setItem(row_position, 3, QTableWidgetItem(deal['sell_station']))
+            self.deals_table.setItem(row_position, 4, sell_price_item)
+            self.deals_table.setItem(row_position, 5, profit_item)
+            self.deals_table.setItem(row_position, 6, volume_item)
+            self.deals_table.setItem(row_position, 7, profit_jump_item)
+            self.deals_table.setItem(row_position, 8, margin_item)
     
-    # --- Header ---
-    header_frame = ctk.CTkFrame(tab_frame, fg_color="transparent")
-    header_frame.grid(row=0, column=0, padx=10, pady=(0, 20), sticky="ew")
-    ctk.CTkLabel(header_frame, text="Prisjeger", font=ctk.CTkFont(size=24, weight="bold")).pack(anchor="w")
+    def show_item_details(self, item):
+        # Get the item from the first column which holds the ID
+        item_with_id = self.deals_table.item(item.row(), 0)
+        item_id = item_with_id.data(Qt.ItemDataRole.UserRole)
+        if item_id:
+            # Create a new window or reuse an existing one
+            if self.item_detail_window is None or not self.item_detail_window.isVisible():
+                self.item_detail_window = ItemDetailWindow(item_id, self)
+                self.item_detail_window.show()
+            else:
+                # If window is already open, just bring it to front
+                self.item_detail_window.activateWindow()
+                self.item_detail_window.raise_()
 
-    # --- Input Frame ---
-    input_frame = ctk.CTkFrame(tab_frame, fg_color=("gray92", "gray28"))
-    input_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=10)
-    input_frame.grid_columnconfigure(1, weight=1)
-
-    ctk.CTkLabel(input_frame, text="Søk etter vare:", font=ctk.CTkFont(size=14)).grid(row=0, column=0, padx=15, pady=15, sticky="w")
-    app.price_hunter_item_entry = ctk.CTkEntry(input_frame, textvariable=app.price_hunter_item_name_var)
-    app.price_hunter_item_entry.grid(row=0, column=1, padx=15, pady=15, sticky="ew")
-    app.price_hunter_item_entry.bind("<KeyRelease>", app._update_suggestions)
-
-    security_frame = ctk.CTkFrame(input_frame, fg_color="transparent")
-    security_frame.grid(row=0, column=2, padx=15, pady=15)
-    ctk.CTkCheckBox(security_frame, text="High-sec", variable=app.price_hunter_hisec_var).pack(side="left", padx=5)
-    ctk.CTkCheckBox(security_frame, text="Low-sec", variable=app.price_hunter_lowsec_var).pack(side="left", padx=5)
-    ctk.CTkCheckBox(security_frame, text="Null-sec", variable=app.price_hunter_nullsec_var).pack(side="left", padx=5)
-
-    app.price_hunter_scan_button = ctk.CTkButton(input_frame, text="Start Søk", command=app.start_price_hunter_scan, height=35)
-    app.price_hunter_scan_button.grid(row=0, column=3, padx=15, pady=15)
-    app.price_hunter_stop_button = ctk.CTkButton(input_frame, text="Stopp", command=app.stop_scan, state="disabled", height=35, fg_color="#D32F2F", hover_color="#B71C1C")
-    app.price_hunter_stop_button.grid(row=0, column=4, padx=15, pady=15)
-
-    # --- Result Frame ---
-    result_frame = ctk.CTkFrame(tab_frame, fg_color=("gray92", "gray28"))
-    result_frame.grid(row=2, column=0, sticky="nsew", padx=10, pady=10)
-    result_frame.grid_columnconfigure(0, weight=1)
-    result_frame.grid_rowconfigure(0, weight=1)
-
-    columns = ('price', 'quantity', 'location', 'system', 'security')
-    app.price_hunter_tree = ttk.Treeview(result_frame, columns=columns, show="headings")
-    headings = {'price': 'Pris', 'quantity': 'Antall', 'location': 'Lokasjon', 'system': 'System', 'security': 'Sikkerhet'}
-    for col, text in headings.items():
-        app.price_hunter_tree.heading(col, text=text, command=lambda c=col: app.sort_results(app.price_hunter_tree, c, False))
-    
-    app.price_hunter_tree.column('price', anchor='e', width=150)
-    app.price_hunter_tree.column('quantity', anchor='e', width=120)
-    app.price_hunter_tree.column('location', anchor='w', width=300)
-    app.price_hunter_tree.column('system', anchor='w', width=150)
-    app.price_hunter_tree.column('security', anchor='center', width=100)
-
-    app.price_hunter_tree.grid(row=0, column=0, sticky="nsew", padx=(1,0), pady=1)
-    scrollbar = ttk.Scrollbar(result_frame, orient="vertical", command=app.price_hunter_tree.yview)
-    app.price_hunter_tree.configure(yscroll=scrollbar.set)
-    scrollbar.grid(row=0, column=1, sticky="ns", padx=(0,1), pady=1)
-    app.price_hunter_tree.bind("<Button-3>", app._on_tree_right_click)

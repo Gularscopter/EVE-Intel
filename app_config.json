@@ -56,5 +56,7 @@
     "price_hunter_nullsec": false,
     "region_buy_station": "",
     "region_sell_station": "",
-    "region_ship_cargo": ""
+    "region_ship_cargo": "",
+    "CLIENT_ID": "ed2279289d2046a6919a55b07ad48d9d",
+    "CLIENT_SECRET": "wxYrr08d1pFfcU3867nJmOnwlgyOKywOhRZJobCC"
 }
