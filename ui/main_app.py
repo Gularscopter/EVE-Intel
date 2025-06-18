@@ -1,144 +1,159 @@
-import json
 import logging
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QTabWidget,
-                             QDockWidget, QTextEdit, QMenuBar)
-from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QAction
-from auth import authenticate_and_get_token, refresh_access_token
-from api import get_character_id, get_character_name
-from config import load_config, save_config
+                             QStatusBar, QTextEdit, QProgressBar)
+from PyQt6.QtCore import QRunnable, QThreadPool, QObject, pyqtSignal, pyqtSlot, QTimer
+
 from ui.tabs.character import CharacterTab
-from ui.tabs.assets import AssetsTab
-from ui.tabs.price_hunter import PriceHunterTab
 from ui.tabs.region_scanner import RegionScannerTab
-from ui.tabs.route_scanners import RouteScannerTab
-from ui.tabs.bpo_scanner import BPOScannerTab
 from ui.tabs.galaxy_scanner import GalaxyScannerTab
 from ui.tabs.analyse import AnalyseTab
 from ui.tabs.manufacturing import ManufacturingTab
 from ui.tabs.settings import SettingsTab
+from ui.tabs.assets import AssetsTab
+from ui.tabs.price_hunter import PriceHunterTab
+from ui.tabs.route_scanners import RouteScannerTab
+from ui.tabs.bpo_scanner import BPOScannerTab
+
+import config
+import auth
+import db
+
+class WorkerSignals(QObject):
+    finished = pyqtSignal()
+    error = pyqtSignal(object)
+    result = pyqtSignal(object)
+    progress = pyqtSignal(str, int) # Signal for progress-oppdateringer
+
+class Worker(QRunnable):
+    def __init__(self, fn, **kwargs):
+        super().__init__()
+        self.fn = fn
+        self.kwargs = kwargs
+        self.signals = WorkerSignals()
+        
+        # Legg til en callback i kwargs for å sende progress
+        if 'status_callback' not in self.kwargs:
+            self.kwargs['status_callback'] = self.signals.progress.emit
+
+    @pyqtSlot()
+    def run(self):
+        try:
+            result = self.fn(**self.kwargs)
+            self.signals.result.emit(result)
+        except Exception as e:
+            self.signals.error.emit(e)
+        finally:
+            self.signals.finished.emit()
 
 class EveMarketApp(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("EVE-Intel")
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("EVE Intel v2.0 - Unstable Branch")
         self.setGeometry(100, 100, 1600, 900)
         
-        logging.info("[DEBUG] MainApp: Initializing.")
-        self.config = load_config()
-        self.access_token = None
-        self.character_id = None
-        self.character_name = "Not Authenticated"
-        self.token_data = None
+        self.threadpool = QThreadPool()
+        
+        self.auth_manager = auth.AuthManager(self)
+        self.character_id = self.auth_manager.character_info.get('id')
+        self.access_token = self.auth_manager.get_valid_token()
 
         self.init_ui()
-        logging.info("[DEBUG] MainApp: UI Initialized.")
-        
-        QTimer.singleShot(100, self.initialize_auth_on_startup)
-        logging.info("[DEBUG] MainApp: Scheduled auto-authentication check.")
+        self.log_message(f"Loaded character ID: {self.character_id}" if self.character_id else "No character loaded.")
 
     def init_ui(self):
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
         self.layout = QVBoxLayout(self.central_widget)
-        self.create_docks()
-        self.create_menus()
         self.tabs = QTabWidget()
         self.layout.addWidget(self.tabs)
+        
+        self.log_console = QTextEdit()
+        self.log_console.setReadOnly(True)
+        self.log_console.setMaximumHeight(150)
+        
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
+        
+        # --- NYTT: Legg til QProgressBar ---
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(False)
+        self.status_bar.addPermanentWidget(self.progress_bar)
+        
+        self.update_status_bar("Applikasjon startet.")
+        
         self.add_tabs()
-        self.update_status_bar("Ready. Please log in.")
+        self.layout.addWidget(self.log_console)
 
-    def initialize_auth_on_startup(self):
-        logging.info("[DEBUG] Auth: Starting automatic token refresh on startup.")
-        try:
-            with open('token.json', 'r') as f:
-                self.token_data = json.load(f)
-            refresh_token_val = self.token_data.get('refresh_token')
-            if not refresh_token_val:
-                raise ValueError("Refresh token not found.")
-
-            self.update_status_bar("Refreshing authentication token...")
-            new_token_data = refresh_access_token(refresh_token_val)
-            
-            if new_token_data:
-                self.process_successful_auth(new_token_data)
-            else:
-                raise ValueError("Token refresh failed.")
-        except (FileNotFoundError, ValueError, KeyError) as e:
-            logging.warning(f"[DEBUG] Auth: Could not auto-refresh token ({e}). Ready for manual login.")
-
-    def trigger_full_authentication(self):
-        logging.info("[DEBUG] Auth: Manual login triggered by button click.")
-        self.update_status_bar("Please authenticate via the browser...")
-        new_token_data = authenticate_and_get_token()
-        logging.info(f"[DEBUG] Auth: authenticate_and_get_token returned: {'Token data received' if new_token_data else 'None'}")
-        if new_token_data:
-            self.process_successful_auth(new_token_data)
-        else:
-            self.update_status_bar("Authentication cancelled or failed.")
-            self.log_message("Authentication was not completed.")
-
-    def process_successful_auth(self, token_data):
-        logging.info("[DEBUG] Auth: Processing successful authentication...")
-        if not token_data or 'access_token' not in token_data:
-            logging.error("[DEBUG] Auth: CRITICAL - process_successful_auth called with invalid token_data.")
-            return
-
-        self.token_data = token_data
-        with open('token.json', 'w') as f: json.dump(self.token_data, f)
-        logging.info("[DEBUG] Auth: Token data saved to token.json.")
+    def run_in_thread(self, fn, on_success, on_error, on_finished=None, **kwargs):
+        worker = Worker(fn, **kwargs)
         
-        self.access_token = self.token_data.get('access_token')
-        self.character_id = get_character_id(self.access_token)
-        logging.info(f"[DEBUG] Auth: Character ID fetched: {self.character_id}")
-        self.character_name = get_character_name(self.character_id) if self.character_id else "Unknown"
-        logging.info(f"[DEBUG] Auth: Character Name fetched: {self.character_name}")
+        worker.signals.result.connect(on_success)
+        worker.signals.error.connect(on_error)
+        worker.signals.progress.connect(self.update_status_bar) # Koble progress-signalet
+        if on_finished:
+            worker.signals.finished.connect(on_finished)
         
-        self.update_status_bar(f"Successfully authenticated as: {self.character_name}")
-        self.post_auth_update()
-
-    def post_auth_update(self):
-        logging.info("[DEBUG] UI: Starting post-authentication update.")
-        for i in range(self.tabs.count()):
-            tab = self.tabs.widget(i)
-            if hasattr(tab, 'load_character_data'):
-                logging.info(f"[DEBUG] UI: Calling load_character_data for {self.tabs.tabText(i)}.")
-                tab.load_character_data()
-        self.update_status_bar(f"Ready. Logged in as: {self.character_name}")
+        self.threadpool.start(worker)
 
     def add_tabs(self):
-        self.tabs.addTab(CharacterTab(self), "Character"); self.tabs.addTab(AssetsTab(self), "Assets")
-        self.tabs.addTab(PriceHunterTab(self), "Price Hunter"); self.tabs.addTab(RegionScannerTab(self), "Region Scanner")
-        self.tabs.addTab(RouteScannerTab(self), "Route Scanner"); self.tabs.addTab(BPOScannerTab(self), "BPO Scanner")
-        self.tabs.addTab(GalaxyScannerTab(self), "Galaxy Scanner"); self.tabs.addTab(AnalyseTab(self), "Analyse")
-        self.tabs.addTab(ManufacturingTab(self), "Manufacturing"); self.tabs.addTab(SettingsTab(self), "Settings")
+        """Legger til alle fanene i QTabWidget."""
+        self.tabs.addTab(CharacterTab(self), "Character")
+        self.tabs.addTab(AssetsTab(self), "Assets")
+        self.tabs.addTab(RegionScannerTab(self), "Station Scanner")
+        self.tabs.addTab(GalaxyScannerTab(self), "Galaxy Scanner")
+        self.tabs.addTab(RouteScannerTab(self), "Route Scanner")
+        self.tabs.addTab(PriceHunterTab(self), "Price Hunter")
+        self.tabs.addTab(AnalyseTab(self), "Analyse")
+        self.tabs.addTab(BPOScannerTab(self), "BPO Scanner")
+        self.tabs.addTab(ManufacturingTab(self), "Manufacturing")
+        self.tabs.addTab(SettingsTab(self), "Settings")
 
-    def create_docks(self):
-        self.log_dock = QDockWidget("Log", self)
-        self.log_widget = QTextEdit(); self.log_widget.setReadOnly(True)
-        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.log_dock)
-        self.log_dock.setWidget(self.log_widget)
-
-    def create_menus(self):
-        menu_bar = self.menuBar()
-        file_menu = menu_bar.addMenu("File")
-        exit_action = QAction("Exit", self); exit_action.triggered.connect(self.close)
-        file_menu.addAction(exit_action)
-        view_menu = menu_bar.addMenu("View")
-        view_menu.addAction(self.log_dock.toggleViewAction())
-
-    def update_status_bar(self, message):
-        self.statusBar().showMessage(message)
-        logging.info(f"Status: {message}")
+    # --- OPPDATERT FUNKSJON ---
+    @pyqtSlot(str, int)
+    @pyqtSlot(str)
+    def update_status_bar(self, message, progress=None):
+        """Oppdaterer statuslinjen med melding og/eller progress."""
+        self.status_bar.showMessage(message)
+        logging.info(message)
+        
+        if progress is not None and progress >= 0:
+            if not self.progress_bar.isVisible():
+                self.progress_bar.setVisible(True)
+            self.progress_bar.setValue(progress)
+        
+        # Skjul progress-baren når oppgaven er ferdig
+        if progress is not None and progress >= 100:
+            QTimer.singleShot(2000, lambda: self.progress_bar.setVisible(False))
 
     def log_message(self, message):
-        if hasattr(self, 'log_widget'):
-            self.log_widget.append(message)
+        self.log_console.append(message)
         logging.info(message)
 
+    def trigger_full_authentication(self):
+        success = self.auth_manager.start_full_auth_flow()
+        if success:
+            self.character_id = self.auth_manager.character_info.get('id')
+            self.access_token = self.auth_manager.get_valid_token()
+            self.log_message(f"Successfully authenticated character: {self.auth_manager.character_info.get('name')}")
+            
+            char_tab = self.find_tab(CharacterTab)
+            if char_tab:
+                char_tab.load_character_data()
+        else:
+            self.log_message("Authentication failed or was cancelled.")
+    
     def get_config_value(self, key, default=None):
-        return self.config.get(key, default)
+        return config.get(key.lower(), default)
 
     def set_config_value(self, key, value):
-        self.config[key] = value
-        save_config(self.config)
+        config.set(key.lower(), value)
+        config.save_config()
+
+    def find_tab(self, tab_class):
+        for i in range(self.tabs.count()):
+            widget = self.tabs.widget(i)
+            if isinstance(widget, tab_class):
+                return widget
+        return None

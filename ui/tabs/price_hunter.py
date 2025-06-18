@@ -1,136 +1,141 @@
 import logging
-from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-                             QLineEdit, QTableWidget, QHeaderView,
-                             QTableWidgetItem, QLabel)
-from PyQt6.QtCore import Qt
-from logic.scanners.price_hunter import find_best_deals
-from ui.components.item_detail_window import ItemDetailWindow
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, 
+                             QComboBox, QCompleter, QGridLayout, QGroupBox, QTableWidget,
+                             QTableWidgetItem, QHeaderView, QCheckBox)
+from PyQt6.QtCore import QStringListModel, Qt
+from functools import partial
+import db
+from logic.scanners.price_hunter import run_price_hunter_scan
 
 class PriceHunterTab(QWidget):
     def __init__(self, main_app, parent=None):
         super().__init__(parent)
         self.main_app = main_app
-        self.item_detail_window = None # To hold reference to the detail window
+        self.full_scan_results = []
         self.init_ui()
+        self.load_initial_data()
 
     def init_ui(self):
-        layout = QVBoxLayout(self)
+        main_layout = QVBoxLayout(self)
+        input_group = QGroupBox("Søk etter beste pris")
+        input_layout = QGridLayout(input_group)
 
-        # Top controls
-        controls_layout = QHBoxLayout()
-        self.start_station_input = QLineEdit()
-        self.start_station_input.setPlaceholderText("Start Station (e.g., Jita IV - Moon 4...)")
-        self.end_station_input = QLineEdit()
-        self.end_station_input.setPlaceholderText("End Station (e.g., Amarr VIII...)")
-        self.volume_input = QLineEdit()
-        self.volume_input.setPlaceholderText("Max Volume (m³)")
-        self.tax_input = QLineEdit()
-        self.tax_input.setPlaceholderText("Tax Rate (%)")
-        self.search_button = QPushButton("Search Best Deals")
-        self.search_button.clicked.connect(self.run_price_hunter)
+        input_layout.addWidget(QLabel("Vare:"), 0, 0)
 
-        controls_layout.addWidget(QLabel("Start:"))
-        controls_layout.addWidget(self.start_station_input)
-        controls_layout.addWidget(QLabel("End:"))
-        controls_layout.addWidget(self.end_station_input)
-        controls_layout.addWidget(QLabel("Volume:"))
-        controls_layout.addWidget(self.volume_input)
-        controls_layout.addWidget(QLabel("Tax:"))
-        controls_layout.addWidget(self.tax_input)
-        controls_layout.addWidget(self.search_button)
+        # --- KORRIGERING HER: Bytter til QComboBox for robust autofullfør ---
+        self.item_combo = QComboBox()
+        self.item_combo.setEditable(True)
+        self.item_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.item_combo.completer().setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+        self.item_combo.lineEdit().setPlaceholderText("Skriv for å søke etter en vare...")
+        input_layout.addWidget(self.item_combo, 0, 1, 1, 3)
+        # -------------------------------------------------------------------
 
-        layout.addLayout(controls_layout)
+        self.hisec_check = QCheckBox("High-sec"); self.hisec_check.setChecked(True)
+        self.lowsec_check = QCheckBox("Low-sec"); self.lowsec_check.setChecked(True)
+        self.nullsec_check = QCheckBox("Null-sec"); self.nullsec_check.setChecked(True)
+        input_layout.addWidget(self.hisec_check, 1, 1)
+        input_layout.addWidget(self.lowsec_check, 1, 2)
+        input_layout.addWidget(self.nullsec_check, 1, 3)
 
-        # Table for results
-        self.deals_table = QTableWidget()
-        self.deals_table.setColumnCount(9)
-        self.deals_table.setHorizontalHeaderLabels([
-            "Item Name", "Buy Station", "Buy Price", "Sell Station", "Sell Price",
-            "Profit per Unit", "Volume", "Profit per Jump", "Margin (%)"
-        ])
-        self.deals_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self.deals_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
-        self.deals_table.setSortingEnabled(True)
-        self.deals_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.deals_table.itemDoubleClicked.connect(self.show_item_details)
-        layout.addWidget(self.deals_table)
+        for checkbox in [self.hisec_check, self.lowsec_check, self.nullsec_check]:
+            checkbox.stateChanged.connect(self.update_display_from_filters)
 
-    def run_price_hunter(self):
-        start_station = self.start_station_input.text()
-        end_station = self.end_station_input.text()
+        self.find_sell_button = QPushButton("Søk Beste Salgspris (Lavest)")
+        self.find_buy_button = QPushButton("Søk Beste Kjøpspris (Høyest)")
         
-        try:
-            max_volume = float(self.volume_input.text()) if self.volume_input.text() else float('inf')
-            tax_rate = float(self.tax_input.text()) if self.tax_input.text() else 0.0
-        except ValueError:
-            self.main_app.update_status_bar("Error: Volume and Tax must be numbers.")
+        self.find_sell_button.clicked.connect(partial(self.run_scan, 'sell'))
+        self.find_buy_button.clicked.connect(partial(self.run_scan, 'buy'))
+        
+        input_layout.addWidget(self.find_sell_button, 2, 1, 1, 2)
+        input_layout.addWidget(self.find_buy_button, 2, 3, 1, 2)
+        
+        main_layout.addWidget(input_group)
+
+        self.results_table = QTableWidget()
+        headers = ['Pris', 'Antall', 'Lokasjon', 'System', 'Sikkerhet']
+        self.results_table.setColumnCount(len(headers))
+        self.results_table.setHorizontalHeaderLabels(headers)
+        self.results_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.results_table.setSortingEnabled(True)
+        main_layout.addWidget(self.results_table)
+
+    def load_initial_data(self):
+        self.all_item_names = db.get_all_item_names()
+        model = QStringListModel(self.all_item_names)
+        completer = QCompleter(model, self)
+        completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        self.item_combo.setCompleter(completer)
+
+    def run_scan(self, order_type):
+        item_name = self.item_combo.currentText()
+        if not item_name:
+            self.main_app.log_message("Vennligst skriv inn en vare å søke etter.")
             return
 
-        if not start_station or not end_station:
-            self.main_app.update_status_bar("Error: Start and End stations are required.")
+        type_id = db.get_item_id_by_name(item_name)
+        if not type_id:
+            self.main_app.log_message(f"Fant ikke varen '{item_name}'.")
             return
+            
+        scan_config = {
+            'item_name': item_name, 'type_id': type_id, 'order_type': order_type,
+        }
 
-        self.main_app.update_status_bar("Searching for best deals... This might take a while.")
+        self.find_buy_button.setEnabled(False); self.find_sell_button.setEnabled(False)
+        self.results_table.setRowCount(0)
+        self.main_app.update_status_bar(f"Søker etter beste {order_type}-pris for {item_name}...", 0)
+
+        self.main_app.run_in_thread(
+            run_price_hunter_scan, on_success=self.on_scan_success,
+            on_error=self.on_scan_error, scan_config=scan_config
+        )
+
+    def on_scan_success(self, results):
+        self.find_buy_button.setEnabled(True); self.find_sell_button.setEnabled(True)
+        self.main_app.update_status_bar(f"Prisjakt fullført. Fant {len(results)} mulige ordre.", 100)
+        self.full_scan_results = results
+        self.update_display_from_filters()
+
+    def update_display_from_filters(self):
+        if not self.full_scan_results: 
+            self.results_table.setRowCount(0)
+            return
         
-        try:
-            # The find_best_deals function needs a callback to update the status bar
-            deals = find_best_deals(start_station, end_station, max_volume, tax_rate, self.main_app.update_status_bar)
-            self.display_deals(deals)
-            self.main_app.update_status_bar("Search complete.")
-        except Exception as e:
-            logging.error(f"Error in price hunter: {e}", exc_info=True)
-            self.main_app.update_status_bar(f"Error: {e}")
+        filtered_results = []
+        for order in self.full_scan_results:
+            sec = order['sec_status']
+            if (sec >= 0.5 and self.hisec_check.isChecked()) or \
+               (0.0 < sec < 0.5 and self.lowsec_check.isChecked()) or \
+               (sec <= 0.0 and self.nullsec_check.isChecked()):
+                filtered_results.append(order)
+        
+        self.display_results(filtered_results)
 
-    def display_deals(self, deals):
-        self.deals_table.setRowCount(0)
-        for deal in deals:
-            row_position = self.deals_table.rowCount()
-            self.deals_table.insertRow(row_position)
+    def display_results(self, results):
+        self.results_table.setRowCount(len(results))
+        for row, order in enumerate(results):
+            sec_val = order.get('sec_status', 0.0)
+            if sec_val >= 0.5: sec_str = f"High ({sec_val:.1f})"
+            elif sec_val > 0.0: sec_str = f"Low ({sec_val:.1f})"
+            else: sec_str = f"Null ({sec_val:.1f})"
             
-            # Store item_id in the first column's data role
-            item_name_item = QTableWidgetItem(deal['item_name'])
-            item_name_item.setData(Qt.ItemDataRole.UserRole, deal['item_id'])
-
-            buy_price_item = QTableWidgetItem()
-            buy_price_item.setData(Qt.ItemDataRole.DisplayRole, f"{deal['buy_price']:,.2f} ISK")
+            self.set_table_item_numeric(row, 0, order.get('price'), "{:,.2f} ISK")
+            self.set_table_item_numeric(row, 1, order.get('quantity'), "{:,}")
+            self.results_table.setItem(row, 2, QTableWidgetItem(order.get('location_name')))
+            self.results_table.setItem(row, 3, QTableWidgetItem(order.get('system_name')))
+            self.results_table.setItem(row, 4, QTableWidgetItem(sec_str))
             
-            sell_price_item = QTableWidgetItem()
-            sell_price_item.setData(Qt.ItemDataRole.DisplayRole, f"{deal['sell_price']:,.2f} ISK")
+        self.results_table.resizeColumnsToContents()
 
-            profit_item = QTableWidgetItem()
-            profit_item.setData(Qt.ItemDataRole.DisplayRole, f"{deal['profit_per_unit']:,.2f} ISK")
-            
-            volume_item = QTableWidgetItem()
-            volume_item.setData(Qt.ItemDataRole.DisplayRole, f"{deal['volume']:.2f} m³")
-
-            profit_jump_item = QTableWidgetItem()
-            profit_jump_item.setData(Qt.ItemDataRole.DisplayRole, f"{deal['profit_per_jump']:,.2f} ISK")
-
-            margin_item = QTableWidgetItem()
-            margin_item.setData(Qt.ItemDataRole.DisplayRole, f"{deal['margin']:.2f}%")
-
-
-            self.deals_table.setItem(row_position, 0, item_name_item)
-            self.deals_table.setItem(row_position, 1, QTableWidgetItem(deal['buy_station']))
-            self.deals_table.setItem(row_position, 2, buy_price_item)
-            self.deals_table.setItem(row_position, 3, QTableWidgetItem(deal['sell_station']))
-            self.deals_table.setItem(row_position, 4, sell_price_item)
-            self.deals_table.setItem(row_position, 5, profit_item)
-            self.deals_table.setItem(row_position, 6, volume_item)
-            self.deals_table.setItem(row_position, 7, profit_jump_item)
-            self.deals_table.setItem(row_position, 8, margin_item)
-    
-    def show_item_details(self, item):
-        # Get the item from the first column which holds the ID
-        item_with_id = self.deals_table.item(item.row(), 0)
-        item_id = item_with_id.data(Qt.ItemDataRole.UserRole)
-        if item_id:
-            # Create a new window or reuse an existing one
-            if self.item_detail_window is None or not self.item_detail_window.isVisible():
-                self.item_detail_window = ItemDetailWindow(item_id, self)
-                self.item_detail_window.show()
-            else:
-                # If window is already open, just bring it to front
-                self.item_detail_window.activateWindow()
-                self.item_detail_window.raise_()
-
+    def on_scan_error(self, e):
+        self.find_buy_button.setEnabled(True); self.find_sell_button.setEnabled(True)
+        self.main_app.log_message(f"Feil under prissøk: {e}")
+        self.main_app.update_status_bar("Prisjakt feilet.", 100)
+        
+    def set_table_item_numeric(self, row, col, data, format_str="{:,.2f}"):
+        if data is None: data = 0
+        item = QTableWidgetItem(format_str.format(data))
+        item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.results_table.setItem(row, col, item)

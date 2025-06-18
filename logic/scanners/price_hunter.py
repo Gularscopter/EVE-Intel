@@ -1,111 +1,78 @@
+import heapq
 import logging
-from collections import defaultdict
-import api 
+import api
 import db
-from logic.scanners.route import get_route # <--- DENNE LINJEN ER NÅ KORRIGERT
 
-def find_best_deals(start_station_name, end_station_name, max_volume, tax_rate, status_callback):
-    """
-    Finner de beste handelsrutene mellom to stasjoner.
-    """
-    status_callback("Resolving station names to IDs...")
-    logging.info(f"Finding deals from '{start_station_name}' to '{end_station_name}'")
-
-    start_station_id = api.resolve_name_to_id(start_station_name, category='station')
-    end_station_id = api.resolve_name_to_id(end_station_name, category='station')
-
-    if not start_station_id: raise ValueError(f"Could not find station ID for '{start_station_name}'. Check spelling.")
-    if not end_station_id: raise ValueError(f"Could not find station ID for '{end_station_name}'. Check spelling.")
-
-    status_callback("Fetching station details (System/Region)...")
-    start_station_details = api.get_station_details(start_station_id)
-    end_station_details = api.get_station_details(end_station_id)
-
-    if not start_station_details: raise ValueError(f"Could not fetch details for start station ID {start_station_id}.")
-    if not end_station_details: raise ValueError(f"Could not fetch details for end station ID {end_station_id}.")
-
-    start_region_id = start_station_details['region_id']
-    end_region_id = end_station_details['region_id']
+def run_price_hunter_scan(scan_config, status_callback):
+    """Scanner alle regioner for den beste prisen på en spesifikk vare."""
     
-    try:
-        route_info = get_route(start_station_details['system_id'], end_station_details['system_id'])
-        jumps = len(route_info) - 1 if route_info else float('inf')
-    except Exception as e:
-        logging.warning(f"Could not calculate jumps: {e}. Defaulting to infinity.")
-        jumps = float('inf')
-
-    status_callback("Fetching market buy orders...")
-    buy_orders = []
-    page = 1
-    while True:
-        orders = api.get_market_orders(int(start_region_id), "buy", page)
-        if not orders: break
-        buy_orders.extend(orders)
-        page += 1
-        status_callback(f"Fetched page {page} of buy orders from region {start_region_id}...")
-
-    status_callback("Fetching market sell orders...")
-    sell_orders = []
-    page = 1
-    while True:
-        orders = api.get_market_orders(int(end_region_id), "sell", page)
-        if not orders: break
-        sell_orders.extend(orders)
-        page += 1
-        status_callback(f"Fetched page {page} of sell orders from region {end_region_id}...")
+    type_id = scan_config.get('type_id')
+    order_type = scan_config.get('order_type')
     
-    status_callback("Processing and comparing orders...")
-    
-    best_buy_prices = defaultdict(lambda: float('-inf'))
-    for order in buy_orders:
-        if order.get('location_id') == start_station_id:
-            best_buy_prices[order['type_id']] = max(best_buy_prices[order['type_id']], order['price'])
+    if not type_id:
+        raise ValueError("Mangler vare-ID for søket.")
 
-    best_sell_prices = defaultdict(lambda: float('inf'))
-    for order in sell_orders:
-        if order.get('location_id') == end_station_id:
-            best_sell_prices[order['type_id']] = min(best_sell_prices[order['type_id']], order['price'])
+    status_callback("Henter system- og regiondata...", 5)
+    all_regions = db.get_all_regions()
+    system_security = db.get_all_system_security()
+    station_to_system = db.get_station_to_system_map()
+
+    top_orders = []
+    total_regions = len(all_regions)
+    tie_breaker = 0
+
+    for i, region in enumerate(all_regions):
+        progress = 10 + int((i / total_regions) * 85)
+        status_callback(f"Sjekker region {i+1}/{total_regions}: {region['name']}...", progress)
+
+        page = 1
+        while True:
+            orders_page, total_pages = api.get_market_orders(region['id'], order_type, page, type_id=type_id)
+            if not orders_page: break
             
-    profitable_deals = []
-    
-    common_type_ids = set(best_buy_prices.keys()) & set(best_sell_prices.keys())
-    status_callback(f"Found {len(common_type_ids)} potential items. Analyzing profits...")
-    
-    for type_id in common_type_ids:
-        buy_price = best_buy_prices[type_id]
-        sell_price = best_sell_prices[type_id]
-        
-        profit_before_tax = sell_price - buy_price
-        tax = sell_price * (tax_rate / 100.0)
-        profit_per_unit = profit_before_tax - tax
-        
-        if profit_per_unit <= 0: continue
-            
-        margin = (profit_per_unit / buy_price) * 100 if buy_price > 0 else 0
-        volume = db.get_item_volume(type_id) or float('inf')
-        
-        if volume > max_volume: continue
-        if buy_price <= 0 or sell_price <= 0: continue
+            for order in orders_page:
+                price = order['price']
+                tie_breaker += 1
+                
+                # Bruker en min-heap for å effektivt holde styr på de 20 beste ordrene.
+                # For salgsordrer (lavest pris) bruker vi negativ pris for å simulere en max-heap.
+                # For kjøpsordrer (høyest pris) bruker vi positiv pris for en min-heap.
+                if order_type == 'sell':
+                    order_tuple = (price, tie_breaker, order)
+                    if len(top_orders) < 20:
+                        heapq.heappush(top_orders, order_tuple)
+                    elif order_tuple[0] < top_orders[-1][0]: # Merk: justert for min-heap
+                        heapq.heappushpop(top_orders, order_tuple)
+                else: # buy orders
+                    order_tuple = (-price, tie_breaker, order) # Bruker negativ for å finne høyeste
+                    if len(top_orders) < 20:
+                        heapq.heappush(top_orders, order_tuple)
+                    elif order_tuple[0] > top_orders[0][0]:
+                        heapq.heapreplace(top_orders, order_tuple)
 
-        profit_per_jump = profit_per_unit / jumps if jumps > 0 else float('inf')
+            if page >= total_pages or page > 50: break
+            page += 1
 
-        profitable_deals.append({
-            'item_id': type_id,
-            'item_name': db.get_item_name(type_id) or "Unknown Item",
-            'buy_station': start_station_name,
-            'buy_price': buy_price,
-            'sell_station': end_station_name,
-            'sell_price': sell_price,
-            'profit_per_unit': profit_per_unit,
-            'volume': volume,
-            'margin': margin,
-            'jumps': jumps,
-            'profit_per_jump': profit_per_jump
+    if not top_orders:
+        status_callback(f"Fant ingen ordre for '{scan_config.get('item_name')}' i noen regioner.", 100)
+        return []
+    
+    status_callback("Forbereder resultater...", 98)
+    final_station_ids = [order_data[2]['location_id'] for order_data in top_orders]
+    station_names = db.get_station_names(final_station_ids)
+    
+    final_results = []
+    for _, _, order_data in top_orders:
+        system_id = station_to_system.get(order_data['location_id'])
+        sec_status_val = system_security.get(system_id, 0.0)
+        
+        final_results.append({
+            'price': order_data['price'],
+            'quantity': order_data['volume_remain'],
+            'location_name': station_names.get(order_data['location_id'], "Ukjent Stasjon"),
+            'system_name': db.get_system_name(system_id),
+            'sec_status': sec_status_val
         })
-
-    profitable_deals.sort(key=lambda x: x['profit_per_jump'], reverse=True)
-    
-    status_callback(f"Analysis complete. Found {len(profitable_deals)} profitable deals.")
-    logging.info(f"Found {len(profitable_deals)} profitable deals.")
-    
-    return profitable_deals
+        
+    sort_reverse = True if order_type == 'buy' else False
+    return sorted(final_results, key=lambda x: x['price'], reverse=sort_reverse)

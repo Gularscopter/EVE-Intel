@@ -1,44 +1,62 @@
 import json
-import os
 import logging
 
-CONFIG_FILE = 'app_config.json'
 _config = {}
 
+# --- Statisk data ---
+STATIONS_INFO = {
+    "Jita": {"id": 60003760, "region_id": 10000002, "system_id": 30000142},
+    "Amarr": {"id": 60008494, "region_id": 10000043, "system_id": 30002187},
+    "Dodixie": {"id": 60011866, "region_id": 10000032, "system_id": 30002659},
+    "Rens": {"id": 60004588, "region_id": 10000030, "system_id": 30002187},
+    "Hek": {"id": 60005686, "region_id": 10000042, "system_id": 30002053},
+}
+
+# --- KORREKT LISTE, NØYAKTIG SOM I TEKSTEN DU GA MEG ---
+EVE_SCOPES = " ".join([
+    "publicData",
+    "esi-location.read_location.v1",
+    "esi-location.read_ship_type.v1",
+    "esi-wallet.read_character_wallet.v1",
+    "esi-search.search_structures.v1",
+    "esi-universe.read_structures.v1",
+    "esi-assets.read_assets.v1",
+    "esi-ui.open_window.v1",
+    "esi-markets.structure_markets.v1",
+    "esi-industry.read_character_jobs.v1",
+    "esi-markets.read_character_orders.v1",
+    "esi-location.read_online.v1",
+    "esi-industry.read_corporation_jobs.v1",
+    "esi-industry.read_character_mining.v1",
+    "esi-industry.read_corporation_mining.v1"
+])
+# ----------------------------------------------------
+
 def load_config():
-    """Laster konfigurasjon fra fil inn i minnet. Kjøres en gang ved oppstart."""
     global _config
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, 'r') as f:
-                _config = json.load(f)
-                logging.info(f"Configuration loaded from {CONFIG_FILE}")
-        except json.JSONDecodeError:
-            logging.error(f"Could not decode JSON from {CONFIG_FILE}. Using default empty config.")
-            _config = {}
-    else:
-        logging.warning(f"{CONFIG_FILE} not found. A new one will be created on save.")
-        _config = {}
-    return _config
-
-def save_config(config_data=None):
-    """Lagrer gjeldende konfigurasjon til fil."""
-    data_to_save = _config if config_data is None else config_data
     try:
-        with open(CONFIG_FILE, 'w') as f:
-            json.dump(data_to_save, f, indent=4)
-            logging.info(f"Configuration saved to {CONFIG_FILE}")
-    except Exception as e:
-        logging.error(f"Failed to save config to {CONFIG_FILE}: {e}")
+        with open('app_config.json', 'r') as f:
+            _config = json.load(f)
+        logging.info("Configuration loaded from app_config.json")
+    except (FileNotFoundError, json.JSONDecodeError):
+        logging.warning("app_config.json not found or invalid. Using default/empty config.")
+        _config = {
+            "client_id": "",
+            "filtered_items_path": "items_filtered.json",
+            "invTypes_path": "invTypes.csv"
+        }
 
-def get_config_value(key, default=None):
-    """Henter en verdi fra minne-konfigurasjonen."""
+def get(key, default=None):
+    if not _config:
+        load_config()
     return _config.get(key, default)
 
-def set_config_value(key, value):
-    """Setter en verdi i minne-konfigurasjonen og lagrer til fil."""
+def set(key, value):
+    if not _config:
+        load_config()
     _config[key] = value
-    save_config()
 
-# Last inn konfigurasjonen automatisk når denne modulen importeres første gang
-load_config()
+def save_config():
+    with open('app_config.json', 'w') as f:
+        json.dump(_config, f, indent=4)
+    logging.info("Configuration saved to app_config.json")
