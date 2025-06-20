@@ -1,79 +1,76 @@
+# logic/scanners/region.py
 import logging
-from collections import defaultdict
 import api
-import db
-from .helpers import get_trend_indicator
 
-def find_best_trades_in_region(region_name, min_profit, min_margin, status_callback):
-    """
-    Finds profitable trades within a region by comparing region-wide
-    buy and sell prices from an aggregated source (Fuzzwork).
-    """
+JITA_HUB_SYSTEM_IDS = {
+    30000142,  # Jita
+    30000144,  # Perimeter
+}
+
+def get_market_volume_stats(region_id, item_id):
+    """Henter volumstatistikk for de siste 7 dagene."""
+    stats = {'avg_volume': 0, 'active_days': 0}
     try:
-        status_callback(f"Resolving region ID for '{region_name}'...")
+        history = api.get_item_price_history(region_id, item_id)
+        if not history or not isinstance(history, list) or not history:
+            return stats
         
-        # ESI does not have a direct 'search region by name' endpoint.
-        # This map provides IDs for major trade hubs.
-        region_map = {
-            "the forge": 10000002, "sinq laison": 10000032, "domain": 10000043, 
-            "heimatar": 10000030, "metropolis": 10000042, "delve": 10000069
-        }
-        region_id = region_map.get(region_name.lower())
-
-        if not region_id:
-            raise ValueError(f"Could not resolve region ID for '{region_name}'. Please use a major trade region (e.g., The Forge, Sinq Laison, Domain).")
+        last_7_days = history[-7:]
+        active_days = sum(1 for day in last_7_days if day.get('volume', 0) > 0)
+        stats['active_days'] = active_days
         
-        status_callback(f"Region ID {region_id} found. Loading filtered item list...")
-        
-        item_ids = db.get_filtered_item_ids()
-        if not item_ids:
-            raise ValueError("Item list is empty. Please generate the item list in the Settings tab.")
-        
-        status_callback(f"Loaded {len(item_ids)} items. Fetching aggregate prices for region...")
+        if len(last_7_days) > 0:
+            total_volume = sum(day.get('volume', 0) for day in last_7_days)
+            stats['avg_volume'] = total_volume / len(last_7_days)
 
-        # Correctly call the updated API function with the 'region_id' keyword
-        market_prices = api.get_market_prices(item_ids, region_id=region_id)
-
-        if not market_prices:
-            raise ValueError("Could not fetch market prices for the region. The API might be down or the region has no orders for the filtered items.")
-            
-        status_callback("Analyzing potential deals...")
-        profitable_deals = []
-        for item_id, prices in market_prices.items():
-            # Fuzzwork provides max buy and min sell for the region
-            buy_price = prices.get('buy', 0)
-            sell_price = prices.get('sell', 0)
-
-            if buy_price == 0 or sell_price == 0:
-                continue
-
-            profit = sell_price - buy_price
-            if profit < min_profit:
-                continue
-
-            margin = (profit / buy_price) * 100 if buy_price > 0 else 0
-            if margin < min_margin:
-                continue
-
-            item_name = db.get_item_name(item_id) or f"Item ID {item_id}"
-            
-            # Since prices are aggregated for the whole region, we can't specify exact stations.
-            profitable_deals.append({
-                'item_name': item_name,
-                'buy_station': f"{region_name} (Region-wide)",
-                'sell_station': f"{region_name} (Region-wide)",
-                'profit': profit,
-                'margin': margin,
-                'volume_str': "N/A",  # Getting volume would require many slow ESI calls
-                'price': sell_price
-            })
-
-        profitable_deals.sort(key=lambda x: x['profit'], reverse=True)
-        status_callback("Region scan complete.")
-        return profitable_deals
-
+        return stats
     except Exception as e:
-        logging.error(f"Error in region scan: {e}", exc_info=True)
-        # Directly send the error to the status bar to be visible
-        status_callback(f"Region Scan ERROR: {e}")
-        return []
+        logging.error(f"Feil under behandling av markedshistorikk for type_id {item_id}: {e}")
+        return stats
+
+def fetch_orders_for_item(item_id, region_id, min_daily_volume, min_active_days, is_debugging, access_token):
+    """Henter nøyaktige ordre-detaljer og finner de beste prisene i Jita/Perimeter-systemene."""
+    # Denne funksjonen bruker _ITEMS_DICT_CACHE, som nå er i worker-tråden.
+    # For å unngå kompliserte avhengigheter, er det bedre å slå opp navnet etterpå.
+    try:
+        volume_stats = get_market_volume_stats(region_id, item_id)
+        avg_daily_volume = volume_stats['avg_volume']
+        active_trading_days = volume_stats['active_days']
+
+        if avg_daily_volume < min_daily_volume: return None
+        if active_trading_days < min_active_days: return None
+
+        all_orders_in_region = []; page = 1
+        while True:
+            orders_page, total_pages = api.get_market_orders(region_id, "all", page, type_id=item_id)
+            if not orders_page: break
+            all_orders_in_region.extend(orders_page)
+            if page >= total_pages: break
+            page += 1
+        
+        if not all_orders_in_region: return None
+        
+        unique_location_ids = {order['location_id'] for order in all_orders_in_region}
+        location_system_map = api.resolve_location_to_system_map(list(unique_location_ids), access_token)
+
+        hub_orders = [
+            order for order in all_orders_in_region
+            if location_system_map.get(order['location_id']) in JITA_HUB_SYSTEM_IDS
+        ]
+        if not hub_orders: return None
+
+        sell_prices = [o['price'] for o in hub_orders if not o.get('is_buy_order', True)]
+        buy_prices = [o['price'] for o in hub_orders if o.get('is_buy_order', False)]
+        if not sell_prices or not buy_prices: return None
+            
+        return {
+            'Item ID': item_id,
+            'Lowest Sell': min(sell_prices),
+            'Highest Buy': max(buy_prices),
+            'Avg Daily Vol': int(avg_daily_volume),
+            'Aktive Dager': active_trading_days
+        }
+    except Exception as e:
+        if is_debugging:
+            logging.warning(f"Feil under detaljert henting av item_id {item_id}: {e}", exc_info=True)
+        return None

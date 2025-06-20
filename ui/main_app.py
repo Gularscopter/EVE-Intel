@@ -1,18 +1,19 @@
+# ui/main_app.py
 import logging
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QTabWidget,
                              QStatusBar, QTextEdit, QProgressBar)
 from PyQt6.QtCore import QRunnable, QThreadPool, QObject, pyqtSignal, pyqtSlot, QTimer
 
 from ui.tabs.character import CharacterTab
+from ui.tabs.assets import AssetsTab
 from ui.tabs.region_scanner import RegionScannerTab
 from ui.tabs.galaxy_scanner import GalaxyScannerTab
+from ui.tabs.route_scanners import RouteScannerTab
+from ui.tabs.price_hunter import PriceHunterTab
 from ui.tabs.analyse import AnalyseTab
+from ui.tabs.bpo_scanner import BPOScannerTab
 from ui.tabs.manufacturing import ManufacturingTab
 from ui.tabs.settings import SettingsTab
-from ui.tabs.assets import AssetsTab
-from ui.tabs.price_hunter import PriceHunterTab
-from ui.tabs.route_scanners import RouteScannerTab
-from ui.tabs.bpo_scanner import BPOScannerTab
 
 import config
 import auth
@@ -22,7 +23,7 @@ class WorkerSignals(QObject):
     finished = pyqtSignal()
     error = pyqtSignal(object)
     result = pyqtSignal(object)
-    progress = pyqtSignal(str, int) # Signal for progress-oppdateringer
+    progress = pyqtSignal(str, int)
 
 class Worker(QRunnable):
     def __init__(self, fn, **kwargs):
@@ -31,7 +32,6 @@ class Worker(QRunnable):
         self.kwargs = kwargs
         self.signals = WorkerSignals()
         
-        # Legg til en callback i kwargs for å sende progress
         if 'status_callback' not in self.kwargs:
             self.kwargs['status_callback'] = self.signals.progress.emit
 
@@ -55,6 +55,7 @@ class EveMarketApp(QMainWindow):
         
         self.auth_manager = auth.AuthManager(self)
         self.character_id = self.auth_manager.character_info.get('id')
+        # La oss hente token her for å være sikker
         self.access_token = self.auth_manager.get_valid_token()
 
         self.init_ui()
@@ -74,7 +75,6 @@ class EveMarketApp(QMainWindow):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         
-        # --- NYTT: Legg til QProgressBar ---
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
@@ -91,17 +91,19 @@ class EveMarketApp(QMainWindow):
         
         worker.signals.result.connect(on_success)
         worker.signals.error.connect(on_error)
-        worker.signals.progress.connect(self.update_status_bar) # Koble progress-signalet
+        worker.signals.progress.connect(self.update_status_bar)
         if on_finished:
             worker.signals.finished.connect(on_finished)
         
         self.threadpool.start(worker)
 
     def add_tabs(self):
-        """Legger til alle fanene i QTabWidget."""
         self.tabs.addTab(CharacterTab(self), "Character")
         self.tabs.addTab(AssetsTab(self), "Assets")
-        self.tabs.addTab(RegionScannerTab(self), "Station Scanner")
+        
+        # --- DENNE LINJEN ER ENDRET FOR Å SENDE MED 'self' ---
+        self.tabs.addTab(RegionScannerTab(self), "Region Scanner")
+        
         self.tabs.addTab(GalaxyScannerTab(self), "Galaxy Scanner")
         self.tabs.addTab(RouteScannerTab(self), "Route Scanner")
         self.tabs.addTab(PriceHunterTab(self), "Price Hunter")
@@ -110,11 +112,9 @@ class EveMarketApp(QMainWindow):
         self.tabs.addTab(ManufacturingTab(self), "Manufacturing")
         self.tabs.addTab(SettingsTab(self), "Settings")
 
-    # --- OPPDATERT FUNKSJON ---
     @pyqtSlot(str, int)
     @pyqtSlot(str)
     def update_status_bar(self, message, progress=None):
-        """Oppdaterer statuslinjen med melding og/eller progress."""
         self.status_bar.showMessage(message)
         logging.info(message)
         
@@ -123,7 +123,6 @@ class EveMarketApp(QMainWindow):
                 self.progress_bar.setVisible(True)
             self.progress_bar.setValue(progress)
         
-        # Skjul progress-baren når oppgaven er ferdig
         if progress is not None and progress >= 100:
             QTimer.singleShot(2000, lambda: self.progress_bar.setVisible(False))
 

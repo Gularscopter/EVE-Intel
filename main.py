@@ -2,27 +2,33 @@ import sys
 import logging
 from PyQt6.QtWidgets import QApplication
 from ui.main_app import EveMarketApp
-import config
+import db
 
 def main():
-    """Hovedfunksjon for å starte applikasjonen."""
-    # Sett opp logging for å fange feil og informasjon
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-    
-    # Last inn konfigurasjonen fra app_config.json
-    # Funksjonen i config.py kjøres automatisk når den importeres,
-    # men vi kan kalle den eksplisitt her for klarhetens skyld.
-    config.load_config()
+    """
+    Hovedfunksjonen for EVE-Intel-applikasjonen.
+    """
+    # Konfigurerer logging for å vise meldinger i terminalen
+    logging.basicConfig(
+        level=logging.INFO, 
+        format='%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
+    )
 
-    # Opprett Qt-applikasjonen
-    app = QApplication(sys.argv)
-    
-    # Opprett og vis hovedvinduet
-    window = EveMarketApp()
-    window.show()
-    
-    # Start applikasjonens event-loop
-    sys.exit(app.exec())
+    try:
+        # FJERNET: db.init_db() - Denne funksjonen finnes ikke i din db.py
+        # logging.info("Database initialisert.") 
+
+        app = QApplication(sys.argv)
+        
+        window = EveMarketApp()
+        window.show()
+        
+        logging.info("Applikasjon startet vellykket.")
+        sys.exit(app.exec())
+
+    except Exception as e:
+        logging.critical(f"En kritisk feil oppstod under oppstart: {e}", exc_info=True)
+        sys.exit(1)
 
 if __name__ == '__main__':
     main()
