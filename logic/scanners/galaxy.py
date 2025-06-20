@@ -2,9 +2,9 @@ import logging
 from collections import defaultdict
 import api
 import db
+from logic.route_planner import find_shortest_path
 
 def _create_optimal_bundle(items, cargo_capacity, max_investment, station_name="Multi-Stasjon"):
-    """Bygger den mest lønnsomme pakken basert på en liste med bekreftede, lønnsomme varer."""
     for item in items:
         item['profit_density'] = item['net_profit_per_unit'] / item['item_m3'] if item.get('item_m3', 0) > 0 else 0
 
@@ -36,7 +36,10 @@ def _create_optimal_bundle(items, cargo_capacity, max_investment, station_name="
                 'total_profit_for_item': item_profit,
                 'buy_station_name': item.get('buy_station_name', 'Ukjent'),
                 'sell_station_name': item.get('sell_station_name', 'Ukjent'),
-                'volume_str': f"{item.get('buy_volume'):,} / {item.get('sell_volume'):,}"
+                'buy_system_id': item.get('buy_system_id'),
+                'sell_system_id': item.get('sell_system_id'),
+                'volume_str': f"{item.get('buy_volume'):,} / {item.get('sell_volume'):,}",
+                'jumps': item.get('jumps') 
             }
             bundle_items.append(item_data)
             
@@ -49,7 +52,6 @@ def _create_optimal_bundle(items, cargo_capacity, max_investment, station_name="
     }
 
 def run_galaxy_scan(scan_config, status_callback):
-    """Bruker en hybrid Fuzzwork/ESI-tilnærming for rask og nøyaktig skanning."""
     status_callback("Forbereder...", 0)
     buy_region_id = api.resolve_name_to_id(scan_config['buy_region'], 'region')
     sell_region_id = api.resolve_name_to_id(scan_config['sell_region'], 'region')
@@ -76,9 +78,10 @@ def run_galaxy_scan(scan_config, status_callback):
     items_to_find_buys, items_to_find_sells = set(profitable_candidates.keys()), set(profitable_candidates.keys())
 
     _, total_sell_pages = api.get_market_orders(buy_region_id, "sell", 1)
+    # Begrenser sidetall for å unngå for lange søk
     for page in range(1, min(total_sell_pages, 200) + 1):
         if not items_to_find_buys: break
-        progress = 10 + int((page / total_sell_pages) * 40)
+        progress = 10 + int((page / min(total_sell_pages, 200)) * 40)
         status_callback(f"Søker i salgsordrer i {scan_config['buy_region']} (side {page}/{total_sell_pages})...", progress)
         orders_page, _ = api.get_market_orders(buy_region_id, "sell", page)
         if not orders_page: break
@@ -89,7 +92,7 @@ def run_galaxy_scan(scan_config, status_callback):
     _, total_buy_pages = api.get_market_orders(sell_region_id, "buy", 1)
     for page in range(1, min(total_buy_pages, 200) + 1):
         if not items_to_find_sells: break
-        progress = 50 + int((page / total_buy_pages) * 40)
+        progress = 50 + int((page / min(total_buy_pages, 200)) * 40)
         status_callback(f"Søker i kjøpsordrer i {scan_config['sell_region']} (side {page}/{total_buy_pages})...", progress)
         orders_page, _ = api.get_market_orders(sell_region_id, "buy", page)
         if not orders_page: break
@@ -99,26 +102,19 @@ def run_galaxy_scan(scan_config, status_callback):
 
     status_callback("Kobler sammen og forbereder data...", 90)
     all_location_ids = {o['location_id'] for o in found_buy_orders.values()} | {o['location_id'] for o in found_sell_orders.values()}
-    npc_station_ids = {loc_id for loc_id in all_location_ids if loc_id < 100_000_000_000}
+    station_to_system_map = db.get_station_to_system_map()
+    
+    # Henter alle stasjons- og strukturnavn i færre kall
+    npc_station_ids = {loc_id for loc_id in all_location_ids if loc_id in station_to_system_map}
     player_structure_ids = all_location_ids - npc_station_ids
-    
-    location_details = {}
+    location_name_map = {}
     if npc_station_ids:
-        station_name_map = db.get_station_names(list(npc_station_ids))
-        for station_id, name in station_name_map.items():
-            location_details[station_id] = {'name': name} # Lagrer som ordbok for konsistens
-            
-    if player_structure_ids:
-        if (access_token := scan_config.get('access_token')):
-            for i, struct_id in enumerate(player_structure_ids):
-                status_callback(f"Henter navn på struktur {i+1}/{len(player_structure_ids)}...", 91)
-                location_details[struct_id] = api.get_structure_name(struct_id, access_token)
-        else:
-            logging.warning("Ingen access_token. Kan ikke hente navn på spiller-eide strukturer.")
-            for struct_id in player_structure_ids:
-                location_details[struct_id] = {'name': f"Struktur ID: {struct_id}"}
-    
-    station_to_system = db.get_station_to_system_map()
+        location_name_map.update(db.get_station_names(list(npc_station_ids)))
+    if player_structure_ids and scan_config.get('access_token'):
+        for struct_id in player_structure_ids:
+            details = api.get_structure_details(struct_id, scan_config['access_token'])
+            location_name_map[struct_id] = details.get('name', f"Struktur ID: {struct_id}")
+
     system_security = db.get_all_system_security()
     item_volume_map = {item_id: db.get_item_volume(item_id) for item_id in profitable_candidates}
     
@@ -126,26 +122,39 @@ def run_galaxy_scan(scan_config, status_callback):
     for item_id, buy_order in found_buy_orders.items():
         if item_id in found_sell_orders:
             sell_order = found_sell_orders[item_id]
-            system_id = station_to_system.get(buy_order['location_id'])
-            if not system_id and buy_order['location_id'] in player_structure_ids:
-                system_id = location_details.get(buy_order['location_id'], {}).get('solar_system_id')
-            if system_id:
+            buy_loc_id = buy_order['location_id']
+            sell_loc_id = sell_order['location_id']
+            
+            buy_system_id = station_to_system_map.get(buy_loc_id)
+            sell_system_id = station_to_system_map.get(sell_loc_id)
+
+            # Fallback for strukturer
+            if not buy_system_id and buy_loc_id in player_structure_ids:
+                 # Dette krever en forbedring i hvordan vi henter system_id for strukturer
+                 # For nå, hopper vi over hvis vi ikke finner det lett
+                 pass
+            if not sell_system_id and sell_loc_id in player_structure_ids:
+                 pass
+            
+            if buy_system_id and sell_system_id:
+                jumps = db.calculate_shortest_path(buy_system_id, sell_system_id)
                 all_verifiable_trades.append({
                     'item_id': item_id, 'item_name': db.get_type_name_from_sde(item_id),
                     'item_m3': item_volume_map.get(item_id),
                     'buy_price': buy_order['price'], 'sell_price': sell_order['price'],
-                    'buy_station_name': location_details.get(buy_order['location_id'], {}).get('name'),
-                    'sell_station_name': location_details.get(sell_order['location_id'], {}).get('name'),
-                    'sec_status': system_security.get(system_id, 0.0),
-                    'buy_volume': buy_order['volume_remain'], 'sell_volume': sell_order['volume_remain']
+                    'buy_station_name': location_name_map.get(buy_loc_id, f"Ukjent ({buy_loc_id})"),
+                    'sell_station_name': location_name_map.get(sell_loc_id, f"Ukjent ({sell_loc_id})"),
+                    'buy_system_id': buy_system_id,
+                    'sell_system_id': sell_system_id,
+                    'sec_status': system_security.get(buy_system_id, 0.0),
+                    'buy_volume': buy_order['volume_remain'], 'sell_volume': sell_order['volume_remain'],
+                    'jumps': jumps
                 })
 
     status_callback("Datainnhenting fullført.", 100)
     return all_verifiable_trades
 
-
 def build_bundles_from_trades(all_trades, scan_config, status_callback):
-    """STEG 2: Filtrerer rådata og bygger optimale pakker uten nye API-kall."""
     status_callback("Filtrerer handler...", 95)
     
     filtered_by_sec = [
@@ -177,17 +186,63 @@ def build_bundles_from_trades(all_trades, scan_config, status_callback):
     if not items_to_bundle: return []
 
     status_callback("Bygger handelspakker...", 98)
+    
+    bundles_to_build = []
     if scan_config['allow_multistation']:
         bundle = _create_optimal_bundle(items_to_bundle, scan_config['ship_cargo_m3'], scan_config['max_investment'])
-        if bundle and bundle['items'] and bundle['total_profit'] >= scan_config['min_profit_total']: return [bundle]
+        if bundle and bundle['items']:
+            bundles_to_build.append(bundle)
     else:
         items_by_station = defaultdict(list)
         for item in items_to_bundle: items_by_station[item['buy_station_name']].append(item)
-        all_bundles = []
         for station_name, items in items_by_station.items():
             bundle = _create_optimal_bundle(items, scan_config['ship_cargo_m3'], scan_config['max_investment'], station_name)
-            if bundle and bundle['items'] and bundle['total_profit'] >= scan_config['min_profit_total']:
-                all_bundles.append(bundle)
-        return sorted(all_bundles, key=lambda x: x['total_profit'], reverse=True)
-    
-    return []
+            if bundle and bundle['items']:
+                bundles_to_build.append(bundle)
+
+    final_bundles = []
+    for bundle in bundles_to_build:
+        if bundle['total_profit'] < scan_config['min_profit_total']:
+            continue
+            
+        buy_system_ids = list(set(item['buy_system_id'] for item in bundle['items']))
+        
+        if len(buy_system_ids) > 1 and scan_config.get('character_id') and scan_config.get('access_token'):
+            status_callback(f"Planlegger optimal kjøpsrute...", 99)
+            start_system_id = api.get_character_current_system_id(scan_config['character_id'], scan_config['access_token'])
+            
+            if start_system_id:
+                all_buy_points = list(set([start_system_id] + buy_system_ids))
+                if len(all_buy_points) > 1:
+                    distance_matrix = db.get_distance_matrix(all_buy_points)
+                    route, total_jumps = find_shortest_path(distance_matrix, start_system_id, buy_system_ids)
+                    if route:
+                        bundle['buy_route_plan'] = route
+                        bundle['buy_route_total_jumps'] = total_jumps
+
+        sell_system_ids = list(set(item['sell_system_id'] for item in bundle['items']))
+        last_buy_system = bundle.get('buy_route_plan', [None])[-1] or (buy_system_ids[0] if buy_system_ids else None)
+        
+        if len(sell_system_ids) > 1 and last_buy_system:
+            status_callback(f"Planlegger optimal salgsrute...", 99)
+            all_sell_points = list(set([last_buy_system] + sell_system_ids))
+            if len(all_sell_points) > 1:
+                distance_matrix = db.get_distance_matrix(all_sell_points)
+                route, total_jumps = find_shortest_path(distance_matrix, last_buy_system, sell_system_ids)
+                if route:
+                    bundle['sell_route_plan'] = route
+                    bundle['sell_route_total_jumps'] = total_jumps
+
+        if 'buy_route_plan' in bundle:
+            full_route = list(bundle['buy_route_plan'])
+            if 'sell_route_plan' in bundle:
+                full_route.extend(bundle['sell_route_plan'][1:])
+            bundle['full_route_plan'] = full_route
+        elif len(buy_system_ids) == 1 and 'sell_route_plan' in bundle:
+             # Håndterer tilfellet med ett kjøpssystem og flere salgssystemer
+             full_route = [buy_system_ids[0]] + bundle['sell_route_plan']
+             bundle['full_route_plan'] = list(dict.fromkeys(full_route)) # Fjerner duplikater
+
+        final_bundles.append(bundle)
+
+    return sorted(final_bundles, key=lambda x: x['total_profit'], reverse=True)

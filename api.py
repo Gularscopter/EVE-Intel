@@ -6,8 +6,8 @@ import config
 import time
 from collections import defaultdict
 import threading
+import json
 
-# --- SENTRALISERT RATE-LIMITER FOR ESI (Tryggere versjon) ---
 class RateLimiter:
     def __init__(self):
         self.lock = threading.Lock()
@@ -51,9 +51,9 @@ def esi_request(url, method='get', **kwargs):
 
         return response
     except requests.exceptions.RequestException as e:
-        logging.error(f"Nettverksfeil under kall til {url}: {e}")
+        # FORBEDRET LOGGING
+        logging.error(f"Nettverksfeil under kall til {url}: {e}", exc_info=True)
         return None
-# --- SLUTT PÅ RATE-LIMITER ---
 
 ESI_BASE_URL = "https://esi.evetech.net/latest"
 LOGIN_BASE_URL = "https://login.eveonline.com"
@@ -190,6 +190,29 @@ def get_character_location(character_id, access_token):
     except requests.exceptions.RequestException as e:
         logging.error(f"Could not fetch character location for character {character_id}: {e}")
         return None
+        
+## NY FUNKSJON
+def get_character_current_system_id(character_id, access_token):
+    """Henter nåværende solsystem-ID for en karakter."""
+    location_data = get_character_location(character_id, access_token)
+    if not location_data:
+        logging.warning("Kunne ikke hente karakterens posisjon.")
+        return None
+
+    location_id = location_data.get('solar_system_id')
+    if location_id:
+        return location_id
+    
+    station_id = location_data.get('station_id')
+    structure_id = location_data.get('structure_id')
+    
+    loc_to_check = station_id or structure_id
+    if loc_to_check:
+        system_map = resolve_location_to_system_map([loc_to_check], access_token)
+        return system_map.get(loc_to_check)
+        
+    logging.error(f"Kunne ikke bestemme system-ID fra posisjonsdata: {location_data}")
+    return None
 
 def get_structure_details(structure_id, access_token):
     now = time.time()
@@ -406,16 +429,14 @@ def get_market_history_for_items(type_ids, region_id=10000002):
             volumes[type_id] = 0
     return volumes
 
-# --- NY FUNKSJON FOR Å ÅPNE MARKEDET I SPILLET ---
-def open_market_window(type_id, access_token, status_callback=None): # Lagt til status_callback for å unngå krasj
-    """Sender en kommando til ESI for å åpne markedsdetaljer for en vare i spillet."""
+def open_market_window(type_id, access_token, status_callback=None):
     headers = {"Authorization": f"Bearer {access_token}"}
     params = {'type_id': type_id}
     url = f"{ESI_BASE_URL}/ui/openwindow/marketdetails/"
     
     try:
         response = esi_request(url, method='post', headers=headers, params=params)
-        if response and response.status_code == 204: # 204 No Content er suksess for dette kallet
+        if response and response.status_code == 204:
             logging.info(f"Signal for å åpne markedsvindu for type_id {type_id} sendt.")
             return True
         elif response:
@@ -424,3 +445,29 @@ def open_market_window(type_id, access_token, status_callback=None): # Lagt til 
     except Exception as e:
         logging.error(f"En uventet feil oppstod under open_market_window: {e}")
         return False
+        
+## ENDRET RETURVERDI
+def set_waypoint(destination_id, access_token, clear_other_waypoints=False, add_to_beginning=False):
+    """Setter en enkelt waypoint i spillets autopilot."""
+    headers = {"Authorization": f"Bearer {access_token}"}
+    params = {
+        'destination_id': destination_id,
+        'clear_other_waypoints': clear_other_waypoints,
+        'add_to_beginning': add_to_beginning,
+    }
+    url = f"{ESI_BASE_URL}/v2/ui/autopilot/waypoint/"
+    
+    try:
+        response = esi_request(url, method='post', headers=headers, params=params)
+        if response and response.status_code == 204:
+            return (True, f"Waypoint til {destination_id} ble satt.")
+        elif response:
+            error_message = f"Feil: {response.status_code} - {response.text}"
+            logging.error(f"Feil ved setting av waypoint: {error_message}")
+            return (False, error_message)
+        else:
+            return (False, "Ingen respons fra ESI-serveren.")
+    except Exception as e:
+        error_message = f"En uventet feil oppstod: {e}"
+        logging.error(f"En uventet feil oppstod under set_waypoint: {error_message}", exc_info=True)
+        return (False, error_message)

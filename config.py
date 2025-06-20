@@ -12,7 +12,7 @@ STATIONS_INFO = {
     "Hek": {"id": 60005686, "region_id": 10000042, "system_id": 30002053},
 }
 
-# --- KORREKT LISTE, NØYAKTIG SOM I TEKSTEN DU GA MEG ---
+# --- SCOPE-LISTE ENDRET I HENHOLD TIL DIN SISTE GUIDE ---
 EVE_SCOPES = " ".join([
     "publicData",
     "esi-location.read_location.v1",
@@ -28,7 +28,8 @@ EVE_SCOPES = " ".join([
     "esi-location.read_online.v1",
     "esi-industry.read_corporation_jobs.v1",
     "esi-industry.read_character_mining.v1",
-    "esi-industry.read_corporation_mining.v1"
+    "esi-industry.read_corporation_mining.v1",
+    "esi-ui.write_waypoint.v1" # Endret i henhold til din siste guide
 ])
 # ----------------------------------------------------
 

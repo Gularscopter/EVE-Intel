@@ -1,9 +1,10 @@
-# ui/main_app.py
+import sys
 import logging
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QTabWidget,
                              QStatusBar, QTextEdit, QProgressBar)
 from PyQt6.QtCore import QRunnable, QThreadPool, QObject, pyqtSignal, pyqtSlot, QTimer
 
+# Importerer alle fanene for type-sjekking i closeEvent
 from ui.tabs.character import CharacterTab
 from ui.tabs.assets import AssetsTab
 from ui.tabs.region_scanner import RegionScannerTab
@@ -48,6 +49,7 @@ class Worker(QRunnable):
 class EveMarketApp(QMainWindow):
     def __init__(self, parent=None):
         super().__init__(parent)
+        config.load_config()
         self.setWindowTitle("EVE Intel v2.0 - Unstable Branch")
         self.setGeometry(100, 100, 1600, 900)
         
@@ -55,7 +57,6 @@ class EveMarketApp(QMainWindow):
         
         self.auth_manager = auth.AuthManager(self)
         self.character_id = self.auth_manager.character_info.get('id')
-        # La oss hente token her for å være sikker
         self.access_token = self.auth_manager.get_valid_token()
 
         self.init_ui()
@@ -87,6 +88,10 @@ class EveMarketApp(QMainWindow):
         self.layout.addWidget(self.log_console)
 
     def run_in_thread(self, fn, on_success, on_error, on_finished=None, **kwargs):
+        # Overfør status_callback hvis den ikke allerede er i kwargs
+        if 'status_callback' not in kwargs:
+            kwargs['status_callback'] = self.update_status_bar
+            
         worker = Worker(fn, **kwargs)
         
         worker.signals.result.connect(on_success)
@@ -100,10 +105,7 @@ class EveMarketApp(QMainWindow):
     def add_tabs(self):
         self.tabs.addTab(CharacterTab(self), "Character")
         self.tabs.addTab(AssetsTab(self), "Assets")
-        
-        # --- DENNE LINJEN ER ENDRET FOR Å SENDE MED 'self' ---
         self.tabs.addTab(RegionScannerTab(self), "Region Scanner")
-        
         self.tabs.addTab(GalaxyScannerTab(self), "Galaxy Scanner")
         self.tabs.addTab(RouteScannerTab(self), "Route Scanner")
         self.tabs.addTab(PriceHunterTab(self), "Price Hunter")
@@ -156,3 +158,17 @@ class EveMarketApp(QMainWindow):
             if isinstance(widget, tab_class):
                 return widget
         return None
+
+    def closeEvent(self, event):
+        """Kjøres når vinduet lukkes. Lagrer alle innstillinger."""
+        logging.info("Appen lukkes, lagrer konfigurasjon...")
+        
+        galaxy_tab = self.find_tab(GalaxyScannerTab)
+        if galaxy_tab and hasattr(galaxy_tab, 'save_settings'):
+            galaxy_tab.save_settings()
+            logging.info("GalaxyScannerTab settings saved.")
+        
+        # Lagrer hele config-objektet til fil
+        config.save_config()
+        logging.info("Konfigurasjon lagret til fil.")
+        event.accept()

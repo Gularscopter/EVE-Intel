@@ -30,9 +30,9 @@
     "brokers_fee": "1.5",
     "esi_client_id": "ed2279289d2046a6919a55b07ad48d9d",
     "esi_secret_key": "wxYrr08d1pFfcU3867nJmOnwlgyOKywOhRZJobCC",
-    "access_token": "eyJhbGciOiJSUzI1NiIsImtpZCI6IkpXVC1TaWduYXR1cmUtS2V5IiwidHlwIjoiSldUIn0.eyJzY3AiOlsicHVibGljRGF0YSIsImVzaS1sb2NhdGlvbi5yZWFkX2xvY2F0aW9uLnYxIiwiZXNpLWxvY2F0aW9uLnJlYWRfc2hpcF90eXBlLnYxIiwiZXNpLXdhbGxldC5yZWFkX2NoYXJhY3Rlcl93YWxsZXQudjEiLCJlc2ktc2VhcmNoLnNlYXJjaF9zdHJ1Y3R1cmVzLnYxIiwiZXNpLXVuaXZlcnNlLnJlYWRfc3RydWN0dXJlcy52MSIsImVzaS1hc3NldHMucmVhZF9hc3NldHMudjEiLCJlc2ktdWkub3Blbl93aW5kb3cudjEiLCJlc2ktbWFya2V0cy5zdHJ1Y3R1cmVfbWFya2V0cy52MSIsImVzaS1pbmR1c3RyeS5yZWFkX2NoYXJhY3Rlcl9qb2JzLnYxIiwiZXNpLW1hcmtldHMucmVhZF9jaGFyYWN0ZXJfb3JkZXJzLnYxIiwiZXNpLWxvY2F0aW9uLnJlYWRfb25saW5lLnYxIiwiZXNpLWluZHVzdHJ5LnJlYWRfY29ycG9yYXRpb25fam9icy52MSIsImVzaS1pbmR1c3RyeS5yZWFkX2NoYXJhY3Rlcl9taW5pbmcudjEiLCJlc2ktaW5kdXN0cnkucmVhZF9jb3Jwb3JhdGlvbl9taW5pbmcudjEiXSwianRpIjoiMzM1NDRkZjktNzZlNC00ODQyLTk0YmQtMjlkZTRmNmFkYWM0Iiwia2lkIjoiSldULVNpZ25hdHVyZS1LZXkiLCJzdWIiOiJDSEFSQUNURVI6RVZFOjIxMTg2NTkwMTEiLCJhenAiOiJlZDIyNzkyODlkMjA0NmE2OTE5YTU1YjA3YWQ0OGQ5ZCIsInRlbmFudCI6InRyYW5xdWlsaXR5IiwidGllciI6ImxpdmUiLCJyZWdpb24iOiJ3b3JsZCIsImF1ZCI6WyJlZDIyNzkyODlkMjA0NmE2OTE5YTU1YjA3YWQ0OGQ5ZCIsIkVWRSBPbmxpbmUiXSwibmFtZSI6Ikd1bGFyc2NvcHRlciIsIm93bmVyIjoia2ZvZXhSTFgzTmliVkxrMXZ0cTFlM1hrSmwwPSIsImV4cCI6MTc1MDQzOTg2OSwiaWF0IjoxNzUwNDM4NjY5LCJpc3MiOiJodHRwczovL2xvZ2luLmV2ZW9ubGluZS5jb20ifQ.AeOEKS4IJAiPj7dGgfCK755IFt-kKImZcQWBCA-qcq0Nqn53y7gwjV57gYvMdcy9277hboBGOkeA9gxeE3-rcGS4ZLDgaXXrfAcwsiVUFHsLWyuVMYCGm9yRSorFItjru_r_zj03b8cIi1TzO9VGkPmKmDeTh9_FhcQI55dIi127N-UwchlZCmCdQK6VsRThOgZQOM85lgDdWy_F_-faoGBUu0awwZrgp_VtFpOb-YMKc96-FdP-FKxIfEzKcKP-e_d8h-nDMq1f_4Aot-IkiEzF2ouxBornO67clvtRI3WK6zGhyxJmARD75o7z5TfjIdkoUQV4-6UBa25ZfTYV_w",
-    "refresh_token": "BpFZc+OB4UiTLuKjw9FV1w==",
-    "token_expiry": "2025-06-20T17:17:48.295838+00:00",
+    "access_token": "eyJhbGciOiJSUzI1NiIsImtpZCI6IkpXVC1TaWduYXR1cmUtS2V5IiwidHlwIjoiSldUIn0.eyJzY3AiOlsicHVibGljRGF0YSIsImVzaS1sb2NhdGlvbi5yZWFkX2xvY2F0aW9uLnYxIiwiZXNpLWxvY2F0aW9uLnJlYWRfc2hpcF90eXBlLnYxIiwiZXNpLXdhbGxldC5yZWFkX2NoYXJhY3Rlcl93YWxsZXQudjEiLCJlc2ktc2VhcmNoLnNlYXJjaF9zdHJ1Y3R1cmVzLnYxIiwiZXNpLXVuaXZlcnNlLnJlYWRfc3RydWN0dXJlcy52MSIsImVzaS1hc3NldHMucmVhZF9hc3NldHMudjEiLCJlc2ktdWkub3Blbl93aW5kb3cudjEiLCJlc2ktbWFya2V0cy5zdHJ1Y3R1cmVfbWFya2V0cy52MSIsImVzaS1pbmR1c3RyeS5yZWFkX2NoYXJhY3Rlcl9qb2JzLnYxIiwiZXNpLW1hcmtldHMucmVhZF9jaGFyYWN0ZXJfb3JkZXJzLnYxIiwiZXNpLWxvY2F0aW9uLnJlYWRfb25saW5lLnYxIiwiZXNpLWluZHVzdHJ5LnJlYWRfY29ycG9yYXRpb25fam9icy52MSIsImVzaS1pbmR1c3RyeS5yZWFkX2NoYXJhY3Rlcl9taW5pbmcudjEiLCJlc2ktaW5kdXN0cnkucmVhZF9jb3Jwb3JhdGlvbl9taW5pbmcudjEiLCJlc2ktdWkud3JpdGVfd2F5cG9pbnQudjEiXSwianRpIjoiYTVhZTY5NDQtOTBiNy00MjVmLWI1ZDgtYzI5NWUzMmEyNGQyIiwia2lkIjoiSldULVNpZ25hdHVyZS1LZXkiLCJzdWIiOiJDSEFSQUNURVI6RVZFOjIxMTg2NTkwMTEiLCJhenAiOiJlZDIyNzkyODlkMjA0NmE2OTE5YTU1YjA3YWQ0OGQ5ZCIsInRlbmFudCI6InRyYW5xdWlsaXR5IiwidGllciI6ImxpdmUiLCJyZWdpb24iOiJ3b3JsZCIsImF1ZCI6WyJlZDIyNzkyODlkMjA0NmE2OTE5YTU1YjA3YWQ0OGQ5ZCIsIkVWRSBPbmxpbmUiXSwibmFtZSI6Ikd1bGFyc2NvcHRlciIsIm93bmVyIjoia2ZvZXhSTFgzTmliVkxrMXZ0cTFlM1hrSmwwPSIsImV4cCI6MTc1MDQ1MTk0OSwiaWF0IjoxNzUwNDUwNzQ5LCJpc3MiOiJodHRwczovL2xvZ2luLmV2ZW9ubGluZS5jb20ifQ.ERs6N_k8h02bDNT3DaXRz61TLgXYLGES9OIlW8KTWSLmHKjZBZ4Titnv70JYek8CwhoDAs1uTF-vYE0BTucO36Yb6muW72xOokFNalmcxXomACod3R_NoCiX2sGJSv47f3xt_V3iHcQ9vC-EJ9Gy7NnWfBmdUN6YM8pe5vd1_japq15SzfzwdyRZkfmsAlIGqylM3LHhXianc2WI9Dp9FnpP7dQ2VtXt7oE7xPNDOLVKRN1nIMh0ffnbJDa9-MJEIWvZCIdMyuluQfYt5bB_XHtmPoTZC-RWvuysC0z87SmIqTwM9SM9FdRY-UJhJmgOu-zF6Y1AT7-ASdlNsZkMJA",
+    "refresh_token": "SFJo5xKUZUm6rC36Xk07hQ==",
+    "token_expiry": "2025-06-20T20:39:07.640624+00:00",
     "user_structures": [],
     "bpo_me": "10",
     "bpo_min_daily_volume": "100",
@@ -60,5 +60,20 @@
     "character_id": 2118659011,
     "character_name": "Gularscopter",
     "client_id": "ed2279289d2046a6919a55b07ad48d9d",
-    "client_secret": "wxYrr08d1pFfcU3867nJmOnwlgyOKywOhRZJobCC"
+    "client_secret": "wxYrr08d1pFfcU3867nJmOnwlgyOKywOhRZJobCC",
+    "galaxy_scanner_settings": {
+        "buy_region": "A-R00001",
+        "sell_region": "A-R00001",
+        "cargo_capacity": 5000.0,
+        "max_investment": 100000000.0,
+        "min_profit_total": 1000000.0,
+        "min_profit_per_item": 100000.0,
+        "brokers_fee": 2.5,
+        "sales_tax": 1.5,
+        "allow_multistation": false,
+        "use_common_sell_station": false,
+        "include_hisec": false,
+        "include_lowsec": false,
+        "include_nullsec": false
+    }
 }

@@ -3,8 +3,14 @@ import config
 import json
 import logging
 import os
+from collections import deque, defaultdict # ENDRING: La til defaultdict i importen
 
 DB_FILE = 'sde.sqlite.db'
+
+# Cache for SDE data to avoid repeated queries within a session
+_jump_graph = None
+_system_security_map = None
+_path_cache = {} # Cache for beregnede ruter
 
 def connect_to_sde():
     """Oppretter en tilkobling til SDE-databasen."""
@@ -14,6 +20,82 @@ def connect_to_sde():
     except sqlite3.Error as e:
         print(f"Databasefeil: {e}")
         return None
+
+def _get_jump_graph():
+    """Hjelpefunksjon for å laste og cache system-hopp-grafen fra SDE."""
+    global _jump_graph
+    if _jump_graph is not None:
+        return _jump_graph
+
+    conn = connect_to_sde()
+    if not conn: return {}
+    
+    _jump_graph = {}
+    try:
+        cursor = conn.cursor()
+        # Bygger en adjacency list for alle system-til-system-forbindelser
+        cursor.execute("SELECT fromSolarSystemID, toSolarSystemID FROM mapSolarSystemJumps")
+        for from_system, to_system in cursor.fetchall():
+            if from_system not in _jump_graph:
+                _jump_graph[from_system] = []
+            if to_system not in _jump_graph:
+                _jump_graph[to_system] = []
+            _jump_graph[from_system].append(to_system)
+            _jump_graph[to_system].append(from_system)
+        logging.info(f"Loaded jump graph for {_jump_graph.keys().__len__()} systems.")
+        return _jump_graph
+    except sqlite3.Error as e:
+        logging.error(f"SQL-feil ved lasting av jump graph: {e}")
+        return {}
+    finally:
+        if conn:
+            conn.close()
+
+def calculate_shortest_path(start_system_id, end_system_id):
+    """Beregner korteste antall hopp mellom to systemer ved hjelp av BFS."""
+    if start_system_id == end_system_id:
+        return 0
+    
+    # Bruk cache for å unngå å beregne samme rute flere ganger
+    cache_key = tuple(sorted((start_system_id, end_system_id)))
+    if cache_key in _path_cache:
+        return _path_cache[cache_key]
+        
+    jump_graph = _get_jump_graph()
+    if not start_system_id in jump_graph or not end_system_id in jump_graph:
+        return None 
+
+    queue = deque([(start_system_id, 0)])
+    visited = {start_system_id}
+
+    while queue:
+        current_system, jumps = queue.popleft()
+
+        if current_system == end_system_id:
+            _path_cache[cache_key] = jumps # Lagre resultatet i cachen
+            return jumps
+
+        for neighbor in jump_graph.get(current_system, []):
+            if neighbor not in visited:
+                visited.add(neighbor)
+                queue.append((neighbor, jumps + 1))
+    
+    _path_cache[cache_key] = None # Lagre at rute ikke finnes
+    return None
+
+def get_distance_matrix(system_ids):
+    """Bygger en komplett avstandsmatrise for en gitt liste med systemer."""
+    matrix = defaultdict(dict)
+    unique_ids = list(set(system_ids))
+    for i in range(len(unique_ids)):
+        for j in range(i, len(unique_ids)):
+            start_node = unique_ids[i]
+            end_node = unique_ids[j]
+            distance = calculate_shortest_path(start_node, end_node)
+            if distance is not None:
+                matrix[start_node][end_node] = distance
+                matrix[end_node][start_node] = distance
+    return matrix
 
 def get_all_region_names():
     """Henter en sortert liste med alle regionnavn fra SDE."""
@@ -150,6 +232,24 @@ def get_system_name(system_id):
         if conn:
             conn.close()
 
+def get_system_names(system_ids):
+    """Henter systemnavn for en liste med systemIDs."""
+    if not system_ids: return {}
+    conn = connect_to_sde()
+    if not conn: return {}
+    try:
+        placeholders = ','.join('?' for _ in system_ids)
+        query = f"SELECT solarSystemID, solarSystemName FROM mapSolarSystems WHERE solarSystemID IN ({placeholders})"
+        cursor = conn.cursor()
+        cursor.execute(query, tuple(system_ids))
+        return {row[0]: row[1] for row in cursor.fetchall()}
+    except sqlite3.Error as e:
+        logging.error(f"SQL-feil ved henting av systemnavn: {e}")
+        return {}
+    finally:
+        if conn:
+            conn.close()
+
 def get_item_volume(type_id):
     """Henter volumet til en vare fra SDE."""
     conn = connect_to_sde()
@@ -184,16 +284,21 @@ def get_blueprint_from_sde(product_type_id):
 
 def get_all_system_security():
     """Henter security status for alle solsystemer."""
-    all_systems = {}
+    global _system_security_map
+    if _system_security_map is not None:
+        return _system_security_map
+
     conn = connect_to_sde()
     if not conn: return {}
+    
+    _system_security_map = {}
     try:
         cursor = conn.cursor()
         cursor.execute("SELECT solarSystemID, security FROM mapSolarSystems")
         results = cursor.fetchall()
         for system_id, security_status in results:
-            all_systems[system_id] = security_status
-        return all_systems
+            _system_security_map[system_id] = security_status
+        return _system_security_map
     except sqlite3.Error as e:
         print(f"SQL-feil ved henting av security status: {e}")
         return {}
