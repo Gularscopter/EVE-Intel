@@ -9,7 +9,7 @@ from PyQt6.QtCore import QAbstractTableModel, Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QColor, QAction
 
 sys.path.append('logic')
-from scanners import region as region_helpers 
+from logic.scanners import region as region_helpers 
 import db
 import api
 
@@ -79,71 +79,36 @@ class RegionScannerWorker(QThread):
     def _scan_region_logic(self):
         cfg = self.config
         
+        item_ids_to_scan = []
         if cfg['trace_item_name']:
             logging.info(f"SPORINGSMODUS: Kjører kun for varen '{cfg['trace_item_name']}'.")
             trace_item_id = db.get_item_id_by_name(cfg['trace_item_name'])
             if not trace_item_id:
                 self.progress.emit(f"Fant ikke varen '{cfg['trace_item_name']}'", 100)
                 return
-            all_item_ids = [trace_item_id]
+            item_ids_to_scan = [trace_item_id]
         else:
             logging.info(f"scan_region startet.")
-            all_item_ids = list(self.id_to_name_map.keys())
+            item_ids_to_scan = list(self.id_to_name_map.keys())
 
-        if not all_item_ids: return
-
-        if cfg['trace_item_name']:
-            potentially_profitable_ids = all_item_ids
-        else:
-            self.progress.emit("Steg 1: Henter markedspriser...", 10)
-            if self.isInterruptionRequested(): return
-
-            market_data = api.get_scanner_market_data(all_item_ids, region_id=cfg['region_id'])
-            if not market_data:
-                self.progress.emit("Feil: Kunne ikke hente priser fra Fuzzwork.", 100)
-                return
-            
-            potentially_profitable_ids = []
-            for item_id_str, prices in market_data.items():
-                if self.isInterruptionRequested(): return
-                item_id = int(item_id_str)
-                highest_buy = prices.get('highest_buy', 0); lowest_sell = prices.get('lowest_sell', 0)
-                buy_order_volume = prices.get('buy_order_volume', 0)
-                if not (highest_buy > 0 and lowest_sell > highest_buy): continue
-                absolute_spread = lowest_sell - highest_buy; relative_spread = absolute_spread / highest_buy
-                if not (absolute_spread >= cfg['min_abs_spread'] and relative_spread >= cfg['min_rel_spread']): continue
-                total_fees = (lowest_sell * cfg['sales_tax_rate']) + (lowest_sell * cfg['broker_fee_rate']) + (highest_buy * cfg['broker_fee_rate'])
-                estimated_profit = absolute_spread - total_fees
-                if estimated_profit < cfg['min_profit']: continue
-                market_liquidity = highest_buy * buy_order_volume
-                if market_liquidity < cfg['min_liquidity']: continue
-                potentially_profitable_ids.append(item_id)
-        
-        total_candidates = len(potentially_profitable_ids)
-        logging.info(f"Steg 1 fullført. Fant {total_candidates} kandidater.")
-        if total_candidates == 0:
-            self.progress.emit("Fant ingen kandidater som møtte kravene.", 100)
+        if not item_ids_to_scan:
+            self.progress.emit("Ingen varer å skanne.", 100)
             return
 
-        self.progress.emit(f"Steg 2: Verifiserer {total_candidates} kandidater...", 50)
-        
-        for i, item_id in enumerate(potentially_profitable_ids):
+        results_generator = region_helpers.scan_region_for_profit(
+            config=cfg,
+            item_ids=item_ids_to_scan,
+            access_token=self.access_token,
+            progress_callback=self.progress.emit
+        )
+
+        for item_data in results_generator:
             if self.isInterruptionRequested():
                 logging.info("Skanning avbrutt av bruker.")
-                return
+                break
             
-            progress_percentage = 50 + int(50 * (i + 1) / total_candidates)
-            # --- ENDRING: Bruker den lokale navnefunksjonen ---
-            self.progress.emit(f"Steg 2: Verifiserer '{self.get_item_name(item_id)}' ({i+1}/{total_candidates})", progress_percentage)
-            
-            item_data = region_helpers.fetch_orders_for_item(item_id, cfg['region_id'], cfg['min_avg_vol'], cfg['min_active_days'], cfg['is_debugging'], self.access_token)
-            
-            if item_data:
-                # Beriker dataen med navnet før den sendes til UI-en
-                item_data['Item Name'] = self.get_item_name(item_id)
-                self.item_found.emit(item_data)
-        
-        logging.info("Skanning fullført.")
+            item_data['Item Name'] = self.get_item_name(item_data['Item ID'])
+            self.item_found.emit(item_data)
 
 class RegionScannerTab(QWidget):
     def __init__(self, main_app, parent=None):
@@ -206,7 +171,9 @@ class RegionScannerTab(QWidget):
         self.status_label = QLabel("Ready.")
         self.results_table = QTableView()
         self.results_table.setSortingEnabled(True)
-        self.results_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        header = self.results_table.horizontalHeader()
+        if header:
+            header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.results_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.results_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.model = PandasModel(pd.DataFrame(columns=self.df_columns))
@@ -222,14 +189,17 @@ class RegionScannerTab(QWidget):
     def load_items(self):
         logging.info("Laster varer fra items_filtered.json...")
         try:
-            with open('items_filtered.json', 'r') as f: self.items = json.load(f)
+            with open('EVE-Intel-Project/items_filtered.json', 'r') as f:
+                self.items = json.load(f)
+
             if not self.items or not isinstance(self.items, dict) or len(self.items) == 0:
                 self.status_label.setText("Error: 'items_filtered.json' is empty or invalid.")
                 self.scan_button.setEnabled(False)
             else:
                 self.status_label.setText(f"Loaded {len(self.items)} items. Ready.")
                 self.scan_button.setEnabled(True)
-        except (FileNotFoundError, json.JSONDecodeError):
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            logging.error(f"Could not load 'items_filtered.json': {e}")
             self.status_label.setText("Error: Could not load 'items_filtered.json'.")
             self.scan_button.setEnabled(False)
 
@@ -340,7 +310,10 @@ class RegionScannerTab(QWidget):
         open_action = QAction(f"Åpne '{item_name}' i markedet", self)
         open_action.triggered.connect(lambda: self.trigger_open_market_window(item_id))
         menu.addAction(open_action)
-        menu.exec(self.results_table.viewport().mapToGlobal(position))
+        
+        viewport = self.results_table.viewport()
+        if viewport:
+            menu.exec(viewport.mapToGlobal(position))
 
     def trigger_open_market_window(self, type_id):
         access_token = self.main_app.auth_manager.get_valid_token()
@@ -351,23 +324,9 @@ class RegionScannerTab(QWidget):
         self.main_app.run_in_thread(
             fn=api.open_market_window,
             on_success=lambda result: self.main_app.update_status_bar(
-                "Signal sendt til EVE-klienten." if result else "Kunne ikke sende signal.", 2000
+                "Signal sendt til EVE-klienten." if result else "Kunne ikke sende signal.", 100
             ),
             on_error=lambda e: self.main_app.update_status_bar(f"Feil ved åpning av marked: {e}"),
             type_id=type_id,
             access_token=access_token
         )
-    
-    def load_items(self):
-        logging.info("Laster varer fra items_filtered.json...")
-        try:
-            with open('items_filtered.json', 'r') as f: self.items = json.load(f)
-            if not self.items or not isinstance(self.items, dict) or len(self.items) == 0:
-                self.status_label.setText("Error: 'items_filtered.json' is empty or invalid.")
-                self.scan_button.setEnabled(False)
-            else:
-                self.status_label.setText(f"Loaded {len(self.items)} items. Ready.")
-                self.scan_button.setEnabled(True)
-        except (FileNotFoundError, json.JSONDecodeError):
-            self.status_label.setText("Error: Could not load 'items_filtered.json'.")
-            self.scan_button.setEnabled(False)

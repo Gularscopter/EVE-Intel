@@ -5,7 +5,8 @@ import logging
 import os
 from collections import deque, defaultdict # ENDRING: La til defaultdict i importen
 
-DB_FILE = 'sde.sqlite.db'
+# Build the absolute path to the database file, assuming it's in the same directory as this script.
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sde.sqlite.db')
 
 # Cache for SDE data to avoid repeated queries within a session
 _jump_graph = None
@@ -15,7 +16,7 @@ _path_cache = {} # Cache for beregnede ruter
 def connect_to_sde():
     """Oppretter en tilkobling til SDE-databasen."""
     try:
-        conn = sqlite3.connect(f'file:{DB_FILE}?mode=ro', uri=True)
+        conn = sqlite3.connect(DB_PATH)
         return conn
     except sqlite3.Error as e:
         print(f"Databasefeil: {e}")
@@ -142,7 +143,7 @@ def get_all_item_names():
         if conn:
             conn.close()
             
-def get_item_id_by_name(name):
+def get_item_id(name):
     """Henter en vares typeID basert på navnet."""
     conn = connect_to_sde()
     if not conn: return None
@@ -251,7 +252,7 @@ def get_system_names(system_ids):
             conn.close()
 
 def get_item_volume(type_id):
-    """Henter volumet til en vare fra SDE."""
+    """Henter volumet til en vare basert på typeID."""
     conn = connect_to_sde()
     if not conn: return None
     try:
@@ -264,30 +265,52 @@ def get_item_volume(type_id):
             conn.close()
 
 def get_blueprint_from_sde(product_type_id):
-    """Henter en komplett blueprint-oppskrift fra SDE-databasen."""
+    """
+    Henter materialkravene for et produkt fra SDE.
+    Dette forutsetter at produktet har en produksjons-blueprint.
+    """
     conn = connect_to_sde()
     if not conn: return None
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT typeID, time FROM industryActivity WHERE productTypeID=? AND activityID=1", (product_type_id,))
-        bpo_info = cursor.fetchone()
-        if not bpo_info: return None
-        blueprint_type_id, time = bpo_info
-        cursor.execute("SELECT materialTypeID, quantity FROM industryActivityMaterials WHERE typeID=?", (blueprint_type_id,))
-        materials = [{'typeID': r[0], 'quantity': r[1]} for r in cursor.fetchall()]
-        cursor.execute("SELECT productTypeID, quantity FROM industryActivityProducts WHERE typeID=?", (blueprint_type_id,))
-        products = [{'typeID': r[0], 'quantity': r[1]} for r in cursor.fetchall()]
-        return {'blueprint_id': blueprint_type_id, 'time': time, 'materials': materials, 'products': products}
+        # Finner blueprint typeID basert på produktets typeID (activityID 1 = produksjon)
+        query = """
+        SELECT T2.typeID
+        FROM industryActivityProducts AS T1
+        JOIN invTypes AS T2 ON T1.typeID = T2.typeID
+        WHERE T1.productTypeID = ? AND T1.activityID = 1
+        """
+        cursor.execute(query, (product_type_id,))
+        blueprint = cursor.fetchone()
+        if not blueprint:
+            return None # Ingen blueprint funnet for dette produktet
+        
+        blueprint_type_id = blueprint[0]
+
+        # Henter materialer for den funnede blueprinten
+        material_query = """
+        SELECT T2.typeName, T1.quantity
+        FROM industryActivityMaterials AS T1
+        JOIN invTypes AS T2 ON T1.materialTypeID = T2.typeID
+        WHERE T1.typeID = ? AND T1.activityID = 1
+        """
+        cursor.execute(material_query, (blueprint_type_id,))
+        
+        materials = {row[0]: row[1] for row in cursor.fetchall()}
+        return materials
+    except sqlite3.Error as e:
+        logging.error(f"SQL-feil ved henting av blueprint-data: {e}")
+        return None
     finally:
         if conn:
             conn.close()
 
 def get_all_system_security():
-    """Henter security status for alle solsystemer."""
+    """Henter en ordbok som mapper systemID til security status."""
     global _system_security_map
     if _system_security_map is not None:
         return _system_security_map
-
+    
     conn = connect_to_sde()
     if not conn: return {}
     
@@ -295,19 +318,45 @@ def get_all_system_security():
     try:
         cursor = conn.cursor()
         cursor.execute("SELECT solarSystemID, security FROM mapSolarSystems")
-        results = cursor.fetchall()
-        for system_id, security_status in results:
-            _system_security_map[system_id] = security_status
+        _system_security_map = {row[0]: row[1] for row in cursor.fetchall()}
         return _system_security_map
     except sqlite3.Error as e:
-        print(f"SQL-feil ved henting av security status: {e}")
+        logging.error(f"SQL-feil ved henting av system-security: {e}")
         return {}
     finally:
         if conn:
             conn.close()
 
+def get_all_manufacturable_item_names():
+    """
+    Henter en sortert liste med navn på alle varer som kan produseres fra blueprints
+    i en enkelt, effektiv database-spørring.
+    """
+    conn = connect_to_sde()
+    if not conn: return []
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT DISTINCT t.typeName
+            FROM invTypes t
+            JOIN industryActivityProducts p ON t.typeID = p.productTypeID
+            JOIN industryActivity a ON p.typeID = a.typeID
+            WHERE a.activityID = 1 -- 1 for Manufacturing
+              AND t.published = 1
+            ORDER BY t.typeName ASC;
+        """)
+        return [row[0] for row in cursor.fetchall()]
+    except sqlite3.Error as e:
+        logging.error(f"SQL-feil ved henting av produserbare varenavn: {e}")
+        return []
+    finally:
+        if conn:
+            conn.close()
+
 def get_all_manufacturable_item_ids():
-    """Henter en liste med tupler (productTypeID, blueprintTypeID) for alle produserbare varer fra SDE."""
+    """
+    Henter en liste med typeIDs for alle varer som er produkter av en blueprint.
+    """
     conn = connect_to_sde()
     if not conn: return []
     try:
@@ -322,17 +371,64 @@ def get_all_manufacturable_item_ids():
             conn.close()
 
 def get_filtered_item_ids():
-    """Laster listen med vare-IDer fra den forhåndsfiltrerte JSON-filen."""
+    """Laster en liste med vare-IDer fra items_filtered.json."""
     try:
-        path = config.get('filtered_items_path', 'items_filtered.json')
-        with open(path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            if isinstance(data, dict): return [int(type_id) for type_id in data.values()]
-            elif isinstance(data, list): return [item['typeID'] for item in data if isinstance(item, dict) and 'typeID' in item]
-            else: return []
-    except FileNotFoundError:
-        logging.error(f"Filtered items file not found. Please generate it via the Settings tab.")
+        with open('items_filtered.json', 'r') as f:
+            item_names = json.load(f)
+            return [get_item_id(name) for name in item_names if get_item_id(name) is not None]
+    except (FileNotFoundError, json.JSONDecodeError):
         return []
-    except (json.JSONDecodeError, KeyError, ValueError) as e:
-        logging.error(f"Error reading or parsing filtered items file: {e}")
-        return []
+
+def get_item_name(type_id):
+    """Henter varenavn for en gitt typeID."""
+    # Sjekk om DB_PATH er satt
+    if not DB_PATH:
+        logging.error("Database path not configured.")
+        return "Unknown"
+        
+    conn = connect_to_sde()
+    if not conn:
+        logging.error("Failed to connect to the database in get_item_name.")
+        return "Unknown"
+        
+    try:
+        # Bruk en 'with'-statement for å sikre at tilkoblingen lukkes
+        with conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT typeName FROM invTypes WHERE typeID=?", (type_id,))
+            result = cursor.fetchone()
+            return result[0] if result else "Unknown"
+    except sqlite3.Error as e:
+        logging.error(f"Database error in get_item_name: {e}")
+        return "Unknown"
+
+def get_all_item_name_id_map():
+    """Henter en ordbok som mapper alle publiserte varenavn til deres typeID."""
+    conn = connect_to_sde()
+    if not conn: return {}
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT typeName, typeID FROM invTypes WHERE published = 1")
+        return {row[0]: row[1] for row in cursor.fetchall()}
+    except sqlite3.Error as e:
+        logging.error(f"SQL-feil ved henting av varenavn-ID-map: {e}")
+        return {}
+    finally:
+        if conn:
+            conn.close()
+
+def get_item_id_by_name(item_name):
+    """Fetches the item ID for a given item name from the database."""
+    conn = connect_to_sde()
+    if conn is None:
+        return None
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT typeID FROM invTypes WHERE typeName = ?", (item_name,))
+        result = cursor.fetchone()
+        return result[0] if result else None
+    except Exception as e:
+        logging.error(f"Error fetching item ID for '{item_name}': {e}")
+        return None
+    finally:
+        conn.close()

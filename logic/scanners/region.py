@@ -74,3 +74,34 @@ def fetch_orders_for_item(item_id, region_id, min_daily_volume, min_active_days,
         if is_debugging:
             logging.warning(f"Feil under detaljert henting av item_id {item_id}: {e}", exc_info=True)
         return None
+
+def scan_region_for_profit(config, item_ids, access_token, progress_callback):
+    """
+    Scans a list of items using ESI, checks them against profitability criteria,
+    and yields profitable items one by one.
+    """
+    total_items = len(item_ids)
+    if total_items == 0:
+        progress_callback("No items to scan.", 100)
+        return
+
+    progress_callback(f"Scanning {total_items} items...", 0)
+
+    for i, item_id in enumerate(item_ids):
+        progress_percentage = int(100 * (i + 1) / total_items)
+        # The worker will add the item name to the status message
+        progress_callback(f"Verifying item {i+1}/{total_items}", progress_percentage)
+
+        item_data = fetch_orders_for_item(
+            item_id=item_id,
+            region_id=config['region_id'],
+            min_daily_volume=config['min_avg_vol'],
+            min_active_days=config['min_active_days'],
+            is_debugging=config.get('is_debugging', False),
+            access_token=access_token
+        )
+        
+        if item_data:
+            yield item_data
+    
+    progress_callback("Scan complete.", 100)

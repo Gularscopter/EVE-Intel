@@ -1,7 +1,8 @@
 import sys
 import logging
+from typing import Type, TypeVar
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QTabWidget,
-                             QStatusBar, QTextEdit, QProgressBar)
+                             QStatusBar, QTextEdit, QProgressBar, QLayout)
 from PyQt6.QtCore import QRunnable, QThreadPool, QObject, pyqtSignal, pyqtSlot, QTimer
 
 # Importerer alle fanene for type-sjekking i closeEvent
@@ -19,6 +20,8 @@ from ui.tabs.settings import SettingsTab
 import config
 import auth
 import db
+
+T = TypeVar('T', bound=QWidget)
 
 class WorkerSignals(QObject):
     finished = pyqtSignal()
@@ -47,6 +50,8 @@ class Worker(QRunnable):
             self.signals.finished.emit()
 
 class EveMarketApp(QMainWindow):
+    layout: QVBoxLayout
+
     def __init__(self, parent=None):
         super().__init__(parent)
         config.load_config()
@@ -65,7 +70,9 @@ class EveMarketApp(QMainWindow):
     def init_ui(self):
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
+        
         self.layout = QVBoxLayout(self.central_widget)
+        
         self.tabs = QTabWidget()
         self.layout.addWidget(self.tabs)
         
@@ -106,8 +113,8 @@ class EveMarketApp(QMainWindow):
         self.tabs.addTab(CharacterTab(self), "Character")
         self.tabs.addTab(AssetsTab(self), "Assets")
         self.tabs.addTab(RegionScannerTab(self), "Region Scanner")
-        self.tabs.addTab(GalaxyScannerTab(self), "Galaxy Scanner")
         self.tabs.addTab(RouteScannerTab(self), "Route Scanner")
+        self.tabs.addTab(GalaxyScannerTab(self), "Galaxy Scanner")
         self.tabs.addTab(PriceHunterTab(self), "Price Hunter")
         self.tabs.addTab(AnalyseTab(self), "Analyse")
         self.tabs.addTab(BPOScannerTab(self), "BPO Scanner")
@@ -152,7 +159,7 @@ class EveMarketApp(QMainWindow):
         config.set(key.lower(), value)
         config.save_config()
 
-    def find_tab(self, tab_class):
+    def find_tab(self, tab_class: Type[T]) -> T | None:
         for i in range(self.tabs.count()):
             widget = self.tabs.widget(i)
             if isinstance(widget, tab_class):

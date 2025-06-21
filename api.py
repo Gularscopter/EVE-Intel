@@ -89,7 +89,7 @@ def get_character_id(access_token):
         logging.error(f"Failed to verify token. Status: {e.response.status_code if e.response else 'N/A'}. Response: {error_text}")
         return None
 
-def get_market_prices(type_ids, station_id=None, region_id=None):
+def get_market_prices(type_ids, station_id=None, region_id=None, status_callback=None):
     if not type_ids: return {}
     params = {}
     if station_id: params['station'] = station_id
@@ -98,7 +98,13 @@ def get_market_prices(type_ids, station_id=None, region_id=None):
     unique_type_ids = list(set(type_ids))
     prices = defaultdict(lambda: {'buy': 0, 'sell': 0})
     id_chunks = [unique_type_ids[i:i + 200] for i in range(0, len(unique_type_ids), 200)]
-    for chunk in id_chunks:
+    
+    total_chunks = len(id_chunks)
+    for i, chunk in enumerate(id_chunks):
+        if status_callback:
+            # We'll use a range from 10% to 80% for the fetching part.
+            progress = int(10 + (i / total_chunks) * 70)
+            status_callback(f"Fetching price chunk {i+1}/{total_chunks} from Fuzzwork...", progress)
         try:
             chunk_params = params.copy()
             chunk_params['types'] = ",".join(map(str, chunk))
@@ -111,6 +117,10 @@ def get_market_prices(type_ids, station_id=None, region_id=None):
                 prices[type_id]['sell'] = float(data.get('sell', {}).get('min', 0))
         except (requests.exceptions.RequestException, KeyError, ValueError) as e:
             logging.error(f"Failed to get or parse prices from Fuzzwork API for a chunk: {e}")
+            
+    if status_callback:
+        status_callback("Market prices processed.", 90)
+        
     return prices
 
 def get_scanner_market_data(type_ids, station_id=None, region_id=None):
@@ -471,3 +481,23 @@ def set_waypoint(destination_id, access_token, clear_other_waypoints=False, add_
         error_message = f"En uventet feil oppstod: {e}"
         logging.error(f"En uventet feil oppstod under set_waypoint: {error_message}", exc_info=True)
         return (False, error_message)
+
+def get_station_market_orders(station_id, region_id, page_limit=1000):
+    """
+    Fetches all market orders for a specific station within a region.
+    This is a workaround for the lack of a direct station market endpoint.
+    """
+    all_orders = []
+    for page in range(1, page_limit + 1):
+        orders_page = get_market_orders(region_id, page=page)
+        if not orders_page:
+            break
+        all_orders.extend(orders_page)
+    
+    # Filter orders for the specific station
+    station_orders = [order for order in all_orders if order.get('location_id') == station_id]
+    return station_orders
+
+def get_character_assets(character_id, access_token):
+    headers = {'Authorization': f'Bearer {access_token}'}
+    return _get_all_pages(f'/v5/characters/{character_id}/assets/', headers)

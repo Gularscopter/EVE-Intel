@@ -18,114 +18,106 @@ blueprints = {
     # More blueprints/reprocessing yields could be added here
 }
 
-def _get_market_prices(region_id, item_ids, status_callback):
+def _get_market_prices(item_ids, status_callback):
     """
-    Fetches the lowest sell price for a list of items in a given region.
-    This is used to determine the cost of materials.
+    Fetches market prices for a list of item IDs specifically from Jita 4-4
+    using the more efficient Fuzzwork API endpoint.
     """
-    item_prices = {}
-    all_orders = []
-    page = 1
+    JITA_STATION_ID = 60003760
+
+    if not item_ids:
+        return {}
+        
+    status_callback("Fetching market prices from Fuzzwork...", 10)
     
-    status_callback("Fetching market orders for materials and products...")
-    # Fetch all sell orders in the region
-    while True:
-        orders = api.get_market_orders(region_id, "sell", page)
-        if not orders:
-            break
-        all_orders.extend(orders)
-        page += 1
-        status_callback(f"Fetched page {page} of sell orders...")
+    # Use the api.get_market_prices which calls Fuzzwork.
+    # It now accepts a status_callback to provide progress updates.
+    prices_data = api.get_market_prices(item_ids, station_id=JITA_STATION_ID, status_callback=status_callback)
 
-    # Find the minimum sell price for each required item
-    min_sell_prices = defaultdict(lambda: float('inf'))
-    for order in all_orders:
-        if order['type_id'] in item_ids:
-            min_sell_prices[order['type_id']] = min(min_sell_prices[order['type_id']], order['price'])
-
-    for item_id in item_ids:
-        price = min_sell_prices.get(item_id)
-        if price and price != float('inf'):
-            item_prices[item_id] = price
-            
+    # The prices_data is in the format {type_id: {'buy': X, 'sell': Y}}
+    # We are interested in the lowest sell prices for materials and the product.
+    item_prices = {item_id: data['sell'] for item_id, data in prices_data.items() if data['sell'] > 0}
+    
     return item_prices
 
 
-def find_profitable_bpos(region_name, status_callback):
+def find_profitable_bpos(product_name, me_level, te_level, tax_rate, status_callback):
     """
-    Calculates the profitability of reprocessing certain ore batches (defined in 'blueprints').
-    This function is adapted from the original logic in the GitHub repository.
+    Calculates the profitability of manufacturing a specific item from a blueprint,
+    accounting for Material Efficiency (ME), with prices from Jita 4-4.
     """
-    status_callback(f"BPO Scanner: Resolving region ID for '{region_name}'...")
+    status_callback(f"Resolving blueprint for '{product_name}'...", 0)
     
-    # Use a major hub to find the region ID. This logic can be expanded.
-    hubs = {"The Forge": "Jita IV - Moon 4 - Caldari Navy Assembly Plant", "Domain": "Amarr VIII (Oris) - Emperor Family Academy"}
-    station_name_for_region = hubs.get(region_name)
-    
-    if not station_name_for_region:
-        raise ValueError(f"Cannot determine region ID for '{region_name}'. Try a major hub like 'The Forge'.")
+    product_id = db.get_item_id(product_name)
+    if not product_id:
+        raise ValueError(f"Could not find item ID for '{product_name}'.")
 
-    station_id = api.resolve_name_to_id(station_name_for_region, 'station')
-    station_details = api.get_station_details(station_id)
-    if not station_details:
-        raise ValueError(f"Could not fetch details for station '{station_name_for_region}' to determine region.")
-    
-    region_id = station_details['region_id']
-    status_callback(f"Scanning region ID {region_id}...")
+    materials = db.get_blueprint_from_sde(product_id)
+    if not materials:
+        raise ValueError(f"Could not find blueprint materials for '{product_name}'.")
 
-    # Gather all unique material and product IDs needed for the scan
-    all_item_names = set()
-    for bpo_data in blueprints.values():
-        all_item_names.update(bpo_data['materials'].keys())
-        all_item_names.update(bpo_data['products'].keys())
+    status_callback("Applying material efficiency bonus...", 5)
+    adjusted_materials = {}
+    for material_name, quantity in materials.items():
+        adjusted_quantity = quantity * (1 - (me_level / 100))
+        adjusted_materials[material_name] = adjusted_quantity
 
-    # Convert names to IDs
+    all_item_names = set(adjusted_materials.keys())
+    all_item_names.add(product_name)
+
+    status_callback("Converting item names to IDs...", 8)
     name_to_id_map = {name: db.get_item_id(name) for name in all_item_names}
-    id_to_name_map = {v: k for k, v in name_to_id_map.items() if v is not None}
-    all_item_ids = list(id_to_name_map.keys())
+    item_ids = [item_id for item_id in name_to_id_map.values() if item_id is not None]
 
-    # Get market prices for all items
-    item_prices = _get_market_prices(region_id, all_item_ids, status_callback)
+    item_prices = _get_market_prices(item_ids, status_callback)
     
-    status_callback("Calculating profitability...")
+    status_callback("Calculating profitability...", 95)
     profitable_bpos = []
+    material_details = []
 
-    for name, bpo_data in blueprints.items():
-        try:
-            # Calculate total cost of materials
-            manufacturing_cost = 0
-            for material_name, quantity in bpo_data['materials'].items():
-                material_id = name_to_id_map.get(material_name)
-                if material_id not in item_prices:
-                    raise ValueError(f"Price for material '{material_name}' not found.")
-                manufacturing_cost += item_prices[material_id] * quantity
+    try:
+        material_cost = 0
+        for material_name, quantity in adjusted_materials.items():
+            material_id = name_to_id_map.get(material_name)
+            if material_id not in item_prices:
+                raise ValueError(f"Price for material '{material_name}' not found.")
             
-            # Calculate total value of products
-            product_value = 0
-            for product_name, quantity in bpo_data['products'].items():
-                product_id = name_to_id_map.get(product_name)
-                if product_id not in item_prices:
-                    raise ValueError(f"Price for product '{product_name}' not found.")
-                product_value += item_prices[product_id] * quantity
+            price_per_unit = item_prices[material_id]
+            total_cost = price_per_unit * quantity
+            material_cost += total_cost
             
-            if manufacturing_cost > 0:
-                profit = product_value - manufacturing_cost
-                margin = (profit / manufacturing_cost) * 100
-                
-                # Only add if profitable
-                if profit > 0:
-                    profitable_bpos.append({
-                        'name': name,
-                        'cost': manufacturing_cost,
-                        'price': product_value,
-                        'profit': profit,
-                        'margin': margin
-                    })
-        except (ValueError, KeyError) as e:
-            logging.warning(f"Skipping BPO '{name}' due to calculation error: {e}")
-            continue
+            material_details.append({
+                'name': material_name,
+                'quantity': quantity,
+                'price_per_unit': price_per_unit,
+                'total_cost': total_cost
+            })
+        
+        # Apply base manufacturing tax (0.25%) and the system cost index
+        base_tax = 0.0025  # 0.25%
+        system_cost_index = tax_rate / 100
+        manufacturing_cost = material_cost * (1 + base_tax + system_cost_index)
+
+        if product_id not in item_prices:
+            raise ValueError(f"Price for product '{product_name}' not found.")
+        product_price = item_prices[product_id]
+        
+        if manufacturing_cost > 0:
+            profit = product_price - manufacturing_cost
+            margin = (profit / manufacturing_cost) * 100
             
-    profitable_bpos.sort(key=lambda x: x['profit'], reverse=True)
-    status_callback("BPO scan complete.")
+            if profit > 0:
+                profitable_bpos.append({
+                    'name': product_name,
+                    'cost': manufacturing_cost,
+                    'price': product_price,
+                    'profit': profit,
+                    'margin': margin,
+                    'materials': material_details
+                })
+    except Exception as e:
+        logging.error(f"Error calculating profitability for {product_name}: {e}")
+
+    status_callback("Calculation complete.", 100)
     return profitable_bpos
 
