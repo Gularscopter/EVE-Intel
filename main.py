@@ -1,26 +1,40 @@
-# ==============================================================================
-# EVE MARKET VERKTØY - HOVEDFIL
-# ==============================================================================
 import sys
-# ENDRET IMPORT-LINJE:
+import os
+
+# Add the project root to the Python path
+project_root = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, project_root)
+
+import logging
+from PyQt6.QtWidgets import QApplication
 from ui.main_app import EveMarketApp
-from config import load_items_from_file, load_settings
+import db
 
 def main():
     """
-    Hovedfunksjon for å starte EVE Market Verktøy.
-    Laster inn nødvendige data og starter GUI-loopen.
+    Hovedfunksjonen for EVE-Intel-applikasjonen.
     """
-    # 1. Last inn kritiske varedata. Avslutt hvis det feiler.
-    if not load_items_from_file():
+    # Konfigurerer logging for å vise meldinger i terminalen
+    logging.basicConfig(
+        level=logging.INFO, 
+        format='%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
+    )
+
+    try:
+        # FJERNET: db.init_db() - Denne funksjonen finnes ikke i din db.py
+        # logging.info("Database initialisert.") 
+
+        app = QApplication(sys.argv)
+        
+        window = EveMarketApp()
+        window.show()
+        
+        logging.info("Applikasjon startet vellykket.")
+        sys.exit(app.exec())
+
+    except Exception as e:
+        logging.critical(f"En kritisk feil oppstod under oppstart: {e}", exc_info=True)
         sys.exit(1)
 
-    # 2. Last inn lagrede innstillinger fra config-filen.
-    app_settings = load_settings()
-
-    # 3. Opprett og kjør applikasjonen.
-    app = EveMarketApp(settings_dict=app_settings)
-    app.mainloop()
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

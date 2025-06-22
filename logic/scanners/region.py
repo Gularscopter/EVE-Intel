@@ -1,74 +1,111 @@
-import time
+# logic/scanners/region.py
+import logging
+import statistics
 import api
-import config
-from .helpers import get_trend_indicator, format_time
 
-def run_region_trading_scan(scan_config, all_type_ids, progress_callback):
-    """Kjører 'flipping'-skann innad på én stasjon."""
-    id_to_name = {v: k for k, v in config.ITEM_NAME_TO_ID.items()}
-    scan_type = scan_config['scan_type']
-    active_flag = scan_config['active_flag']
-    base_progress = 0.1
-    
-    station_info = config.STATIONS_INFO[scan_config['station']]
-    item_chunks = [all_type_ids[i:i + 200] for i in range(0, len(all_type_ids), 200)]
-    
-    progress_callback({'scan_type': scan_type, 'progress': base_progress, 'status': f"Steg 1: Henter priser for {scan_config['station']}..."})
-    prices_map = {}
-    for i, chunk in enumerate(item_chunks):
-        if not active_flag.is_set(): return
-        progress = base_progress + (i / len(item_chunks) * 0.4)
-        progress_callback({'scan_type': scan_type, 'progress': progress, 'status': f"Henter pris-gruppe {i+1}/{len(item_chunks)}..."})
-        data = api.fetch_fuzzwork_market_data(station_info['id'], chunk)
-        for typeid_str, item_data in (data or {}).items():
-            prices_map[int(typeid_str)] = item_data
-        time.sleep(0.5)
+JITA_HUB_SYSTEM_IDS = {
+    30000142,  # Jita
+    30000144,  # Perimeter
+}
 
-    progress_callback({'scan_type': scan_type, 'progress': 0.5, 'status': "Steg 2: Finner kandidater..."})
-    candidates = []
-    for type_id in all_type_ids:
-        item_data = prices_map.get(type_id)
-        if not item_data or not item_data.get('buy') or not item_data.get('sell'): continue
-        if float(item_data['buy']['max']) > 0 and float(item_data['sell']['min']) > float(item_data['buy']['max']):
-            candidates.append(type_id)
+def get_market_volume_stats(region_id, item_id):
+    """Henter volumstatistikk for de siste 7 dagene."""
+    stats = {'avg_volume': 0, 'active_days': 0}
+    try:
+        history = api.get_item_price_history(region_id, item_id)
+        if not history or not isinstance(history, list) or not history:
+            return stats
+        
+        last_7_days = history[-7:]
+        active_days = sum(1 for day in last_7_days if day.get('volume', 0) > 0)
+        stats['active_days'] = active_days
+        
+        if len(last_7_days) > 0:
+            daily_volumes = [day.get('volume', 0) for day in last_7_days]
+            # Ensure the list has 7 entries, padding with 0 for missing days
+            while len(daily_volumes) < 7:
+                daily_volumes.append(0)
+            stats['avg_volume'] = int(statistics.median(daily_volumes))
 
-    total_candidates, start_time = len(candidates), time.time()
-    for i, type_id in enumerate(candidates):
-        if not active_flag.is_set(): break
-        item_name = id_to_name.get(type_id, f"ID: {type_id}")
-        progress = 0.5 + ((i + 1) / total_candidates * 0.5) if total_candidates > 0 else 1
-        eta = (total_candidates - (i + 1)) * ((time.time() - start_time) / (i + 1)) if i > 0 else None
-        progress_callback({'scan_type': scan_type, 'progress': progress, 'status': f"Sjekker finalist {i+1}/{total_candidates}: {item_name}", 'eta': f"ETA: {format_time(eta)}"})
-        
-        history = api.fetch_esi_history(station_info['region_id'], type_id)
-        avg_daily_vol = sum(h['volume'] for h in history[-7:]) / 7 if history and len(history) >= 7 else 0
-        if avg_daily_vol < scan_config['min_volume']: continue
-        
-        trend = get_trend_indicator(history)
-        orders_data = api.fetch_market_orders(station_info['region_id'], type_id)
-        if not orders_data: continue
-        
-        highest_buy = max((o for o in orders_data if o['location_id'] == station_info['id'] and o['is_buy_order']), key=lambda x: x['price'], default=None)
-        lowest_sell = min((o for o in orders_data if o['location_id'] == station_info['id'] and not o['is_buy_order']), key=lambda x: x['price'], default=None)
-        if not highest_buy or not lowest_sell: continue
+        return stats
+    except Exception as e:
+        logging.error(f"Feil under behandling av markedshistorikk for type_id {item_id}: {e}")
+        return stats
 
-        # Beregn antall konkurrenter
-        comp_buy = sum(1 for o in orders_data if o['location_id'] == station_info['id'] and o['is_buy_order'] and o['price'] >= highest_buy['price'])
-        comp_sell = sum(1 for o in orders_data if o['location_id'] == station_info['id'] and not o['is_buy_order'] and o['price'] <= lowest_sell['price'])
+def fetch_orders_for_item(item_id, region_id, min_daily_volume, min_active_days, is_debugging, access_token):
+    """Henter nøyaktige ordre-detaljer og finner de beste prisene i Jita/Perimeter-systemene."""
+    # Denne funksjonen bruker _ITEMS_DICT_CACHE, som nå er i worker-tråden.
+    # For å unngå kompliserte avhengigheter, er det bedre å slå opp navnet etterpå.
+    try:
+        volume_stats = get_market_volume_stats(region_id, item_id)
+        avg_daily_volume = volume_stats['avg_volume']
+        active_trading_days = volume_stats['active_days']
+
+        if avg_daily_volume < min_daily_volume: return None
+        if active_trading_days < min_active_days: return None
+
+        all_orders_in_region = []; page = 1
+        while True:
+            orders_page, total_pages = api.get_market_orders(region_id, "all", page, type_id=item_id)
+            if not orders_page: break
+            all_orders_in_region.extend(orders_page)
+            if page >= total_pages: break
+            page += 1
         
-        buy_price = highest_buy['price'] + 0.01
-        sell_price = lowest_sell['price'] - 0.01
-        if buy_price >= sell_price: continue
+        if not all_orders_in_region: return None
         
-        fees = (buy_price * (scan_config['brokers_fee_rate'] / 100)) + (sell_price * (scan_config['brokers_fee_rate'] / 100)) + (sell_price * (scan_config['sales_tax_rate'] / 100))
-        net_profit = (sell_price - buy_price) - fees
-        
-        if net_profit < scan_config['min_profit'] or buy_price > scan_config['max_investment']: continue
-        
-        result = {
-            'item': item_name, 'profit_per_unit': net_profit, 'profit_margin': (net_profit / buy_price) * 100 if buy_price > 0 else 0,
-            'daily_volume': avg_daily_vol, 'buy_price': buy_price, 'sell_price': sell_price, 'trend': trend, 'competition': f"{comp_buy} / {comp_sell}"
+        unique_location_ids = {order['location_id'] for order in all_orders_in_region}
+        location_system_map = api.resolve_location_to_system_map(list(unique_location_ids), access_token)
+
+        hub_orders = [
+            order for order in all_orders_in_region
+            if location_system_map.get(order['location_id']) in JITA_HUB_SYSTEM_IDS
+        ]
+        if not hub_orders: return None
+
+        sell_prices = [o['price'] for o in hub_orders if not o.get('is_buy_order', True)]
+        buy_prices = [o['price'] for o in hub_orders if o.get('is_buy_order', False)]
+        if not sell_prices or not buy_prices: return None
+            
+        return {
+            'Item ID': item_id,
+            'Lowest Sell': min(sell_prices),
+            'Highest Buy': max(buy_prices),
+            'Median Daily Vol': int(avg_daily_volume),
+            'Aktive Dager': active_trading_days
         }
-        progress_callback({'scan_type': 'region_trading', 'result': result})
+    except Exception as e:
+        if is_debugging:
+            logging.warning(f"Feil under detaljert henting av item_id {item_id}: {e}", exc_info=True)
+        return None
 
-    progress_callback({'scan_type': scan_type, 'status': 'Stasjonshandel-skann fullført!'})
+def scan_region_for_profit(config, item_ids, access_token, progress_callback):
+    """
+    Scans a list of items using ESI, checks them against profitability criteria,
+    and yields profitable items one by one.
+    """
+    total_items = len(item_ids)
+    if total_items == 0:
+        progress_callback("No items to scan.", 100)
+        return
+
+    progress_callback(f"Scanning {total_items} items...", 0)
+
+    for i, item_id in enumerate(item_ids):
+        progress_percentage = int(100 * (i + 1) / total_items)
+        # The worker will add the item name to the status message
+        progress_callback(f"Verifying item {i+1}/{total_items}", progress_percentage)
+
+        item_data = fetch_orders_for_item(
+            item_id=item_id,
+            region_id=config['region_id'],
+            min_daily_volume=config['min_avg_vol'],
+            min_active_days=config['min_active_days'],
+            is_debugging=config.get('is_debugging', False),
+            access_token=access_token
+        )
+        
+        if item_data:
+            yield item_data
+    
+    progress_callback("Scan complete.", 100)

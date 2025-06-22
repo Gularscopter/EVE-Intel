@@ -1,79 +1,158 @@
-import tkinter
-import customtkinter as ctk
+import logging
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, 
+                             QComboBox, QDoubleSpinBox, QCompleter, QGridLayout, QGroupBox)
+from PyQt6.QtCore import QStringListModel, Qt
+from functools import partial
+import db
 import config
+from logic.calculations import get_single_item_analysis
 
-def create_tab(tab_frame, app):
-    """
-    Creates the single item analysis tab with a modern layout.
-    """
-    tab_frame.grid_columnconfigure(0, weight=1)
-    tab_frame.grid_rowconfigure(2, weight=1)
+class AnalyseTab(QWidget):
+    def __init__(self, main_app, parent=None):
+        super().__init__(parent)
+        self.main_app = main_app
+        self.all_item_names = []
+        self.result_labels = {}
+        self.init_ui()
+        self.load_initial_data()
 
-    # --- Header Frame ---
-    header_frame = ctk.CTkFrame(tab_frame, fg_color="transparent")
-    header_frame.grid(row=0, column=0, padx=10, pady=(0, 20), sticky="ew")
-    ctk.CTkLabel(header_frame, text="Enkel Vareanalyse", font=ctk.CTkFont(size=24, weight="bold")).pack(anchor="w")
+    def init_ui(self):
+        main_layout = QVBoxLayout(self)
 
-    # --- Input Frame ---
-    input_frame = ctk.CTkFrame(tab_frame, fg_color=("gray92", "gray28"))
-    input_frame.grid(row=1, column=0, padx=10, pady=10, sticky="ew")
-    input_frame.grid_columnconfigure(1, weight=1)
-    input_frame.grid_columnconfigure(3, weight=1)
+        input_group = QGroupBox("Analyse-innstillinger")
+        input_layout = QGridLayout(input_group)
 
-    # Item Selection
-    ctk.CTkLabel(input_frame, text="Vare:").grid(row=0, column=0, padx=10, pady=(10,5), sticky="w")
-    app.item_entry = ctk.CTkEntry(input_frame, textvariable=app.analyse_item_name_var)
-    app.item_entry.grid(row=0, column=1, columnspan=3, padx=10, pady=(10,5), sticky="ew")
-    app.item_entry.bind("<KeyRelease>", app._update_suggestions)
+        input_layout.addWidget(QLabel("Vare:"), 0, 0)
+        self.item_combo = self.create_completer_combo()
+        input_layout.addWidget(self.item_combo, 0, 1)
 
-    # Separator
-    separator1 = ctk.CTkFrame(input_frame, height=1, fg_color=("gray81", "gray33"))
-    separator1.grid(row=1, column=0, columnspan=4, sticky="ew", padx=10, pady=10)
+        input_layout.addWidget(QLabel("Kjøp fra:"), 1, 0)
+        self.buy_station_combo = QComboBox()
+        self.buy_station_combo.addItems(config.STATIONS_INFO.keys())
+        input_layout.addWidget(self.buy_station_combo, 1, 1)
 
-    # Stations and Cargo
-    station_names = list(config.STATIONS_INFO.keys())
-    ctk.CTkLabel(input_frame, text="Kjøp fra:").grid(row=2, column=0, padx=10, pady=5, sticky="w")
-    ctk.CTkComboBox(input_frame, variable=app.analyse_buy_station_var, values=station_names, state="readonly").grid(row=2, column=1, padx=10, pady=5, sticky="ew")
-    
-    ctk.CTkLabel(input_frame, text="Selg til:").grid(row=3, column=0, padx=10, pady=5, sticky="w")
-    ctk.CTkComboBox(input_frame, variable=app.analyse_sell_station_var, values=station_names, state="readonly").grid(row=3, column=1, padx=10, pady=5, sticky="ew")
+        input_layout.addWidget(QLabel("Selg til:"), 2, 0)
+        self.sell_station_combo = QComboBox()
+        self.sell_station_combo.addItems(config.STATIONS_INFO.keys())
+        input_layout.addWidget(self.sell_station_combo, 2, 1)
 
-    ctk.CTkLabel(input_frame, text="Lasterom (m³):").grid(row=4, column=0, padx=10, pady=(5,10), sticky="w")
-    ctk.CTkEntry(input_frame, textvariable=app.analyse_ship_cargo_var).grid(row=4, column=1, padx=10, pady=(5,10), sticky="ew")
-
-    # Sell Method
-    ctk.CTkLabel(input_frame, text="Salgsmetode:").grid(row=2, column=2, padx=(20, 10), pady=5, sticky="w")
-    ctk.CTkRadioButton(input_frame, text="Selg til kjøpsordre (umiddelbart)", variable=app.analyse_sell_method_var, value="Kjøpsordre").grid(row=3, column=2, padx=20, pady=5, sticky="w")
-    ctk.CTkRadioButton(input_frame, text="Konkurrer med salgsordre", variable=app.analyse_sell_method_var, value="Salgsordre").grid(row=4, column=2, padx=20, pady=5, sticky="w")
-    
-    # Action Button
-    app.analyse_button = ctk.CTkButton(input_frame, text="Kjør Analyse", command=app.start_analyse_fetch, height=40)
-    app.analyse_button.grid(row=3, column=3, rowspan=2, padx=10, pady=5, sticky="ns")
-
-    # --- Results Frame ---
-    results_frame = ctk.CTkFrame(tab_frame, fg_color=("gray92", "gray28"))
-    results_frame.grid(row=2, column=0, padx=10, pady=10, sticky="nsew")
-    results_frame.grid_columnconfigure(1, weight=1)
-
-    app.result_labels = {}
-    labels_info = {
-        "buy_price": "Pris / enhet (Kjøp):", 
-        "buy_volume": "Volum på ordre (Kjøp):", 
-        "sell_price": "Pris / enhet (Salg):", 
-        "sell_volume": "Volum på ordre (Salg):", 
-        "transaction_cost": "Transaksjonskostnad / enhet:", 
-        "profit_per_unit": "Netto profitt / enhet:", 
-        "units_per_trip": "Antall enheter per tur:", 
-        "total_profit": "TOTAL NETTO PROFITT PER TUR:"
-    }
-    
-    for i, (key, text) in enumerate(labels_info.items()):
-        font_style = ctk.CTkFont(size=14)
-        if key == "total_profit":
-            font_style = ctk.CTkFont(size=18, weight="bold")
-            separator = ctk.CTkFrame(results_frame, height=1, fg_color=("gray81", "gray33"))
-            separator.grid(row=i, column=0, columnspan=2, sticky="ew", padx=10, pady=10)
+        input_layout.addWidget(QLabel("Lasterom (m³):"), 3, 0)
+        self.cargo_input = QDoubleSpinBox()
+        self.cargo_input.setRange(0, 1000000); self.cargo_input.setValue(4000)
+        self.cargo_input.setGroupSeparatorShown(True); self.cargo_input.setDecimals(0)
+        input_layout.addWidget(self.cargo_input, 3, 1)
         
-        ctk.CTkLabel(results_frame, text=text, anchor="w", font=ctk.CTkFont(size=13)).grid(row=i + (1 if key == 'total_profit' else 0), column=0, padx=15, pady=5, sticky="w")
-        app.result_labels[key] = ctk.CTkLabel(results_frame, text="...", font=font_style, anchor="e")
-        app.result_labels[key].grid(row=i + (1 if key == 'total_profit' else 0), column=1, padx=15, pady=5, sticky="e")
+        button_layout = QHBoxLayout()
+        self.run_vs_sell_button = QPushButton("Analyser mot Salgsordre (Seeding)")
+        self.run_vs_buy_button = QPushButton("Analyser mot Kjøpsordre (Flipping)")
+        
+        self.run_vs_sell_button.clicked.connect(partial(self.run_analysis, 'sell_order'))
+        self.run_vs_buy_button.clicked.connect(partial(self.run_analysis, 'buy_order'))
+
+        button_layout.addWidget(self.run_vs_sell_button)
+        button_layout.addWidget(self.run_vs_buy_button)
+        input_layout.addLayout(button_layout, 4, 1)
+
+        main_layout.addWidget(input_group)
+        
+        result_group = QGroupBox("Resultater")
+        self.result_layout = QGridLayout(result_group)
+        
+        labels_info = {
+            "buy_price": "Pris / enhet (Kjøp):", "sell_price": "Pris / enhet (Salg):",
+            "buy_volume": "Volum på ordre (Kjøp):", "sell_volume": "Volum på ordre (Salg):",
+            "transaction_cost": "Avgifter / enhet:", "profit_per_unit": "Netto profitt / enhet:",
+            "units_per_trip": "Antall enheter per tur:", "total_investment": "Total investering:",
+            "total_profit": "TOTAL NETTO PROFITT PER TUR:"
+        }
+
+        row = 0
+        for key, text in labels_info.items():
+            label_title = QLabel(text)
+            label_value = QLabel("N/A")
+            if key == 'total_profit':
+                label_title.setStyleSheet("font-weight: bold; font-size: 14pt;")
+                label_value.setStyleSheet("font-weight: bold; font-size: 14pt;")
+            
+            self.result_layout.addWidget(label_title, row, 0)
+            self.result_layout.addWidget(label_value, row, 1, Qt.AlignmentFlag.AlignRight)
+            self.result_labels[key] = label_value
+            row += 1
+
+        main_layout.addWidget(result_group)
+        main_layout.addStretch()
+
+    def create_completer_combo(self):
+        combo = QComboBox()
+        combo.setEditable(True)
+        combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        completer = QCompleter(self)
+        completer.setPopup(combo.view())
+        combo.setCompleter(completer)
+        combo.lineEdit().setPlaceholderText("Skriv for å søke...")
+        return combo
+
+    def load_initial_data(self):
+        self.all_item_names = db.get_all_item_names()
+        model = QStringListModel(self.all_item_names)
+        completer = self.item_combo.completer()
+        completer.setModel(model)
+        completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        self.item_combo.setCurrentText("Tritanium")
+
+    def run_analysis(self, analysis_type):
+        for label in self.result_labels.values():
+            label.setText("N/A"); label.setStyleSheet("")
+        self.result_labels['total_profit'].setStyleSheet("font-weight: bold; font-size: 14pt;")
+
+        analysis_config = {
+            'item_name': self.item_combo.currentText(),
+            'buy_station': self.buy_station_combo.currentText(),
+            'sell_station': self.sell_station_combo.currentText(),
+            'ship_cargo': self.cargo_input.value(),
+            'brokers_fee_rate': float(self.main_app.get_config_value('brokers_fee', 3.0)),
+            'sales_tax_rate': float(self.main_app.get_config_value('sales_tax', 8.0)),
+            'analysis_type': analysis_type
+        }
+        
+        self.main_app.update_status_bar(f"Analyserer {analysis_config['item_name']}...", 0)
+        self.run_vs_buy_button.setEnabled(False); self.run_vs_sell_button.setEnabled(False)
+        self.main_app.run_in_thread(
+            get_single_item_analysis,
+            on_success=self.display_results,
+            on_error=self.on_analysis_error,
+            analysis_config=analysis_config
+        )
+
+    def display_results(self, results):
+        # --- DEBUG-UTSAGNFRASE ---
+        print(f"\n--- DEBUG: Mottatt resultat i display_results ---")
+        print(results)
+        print("------------------------------------------------\n")
+        # ---------------------------
+
+        self.run_vs_buy_button.setEnabled(True); self.run_vs_sell_button.setEnabled(True)
+        if 'error' in results:
+            self.main_app.log_message(f"Analyse-feil: {results['error']}")
+            self.main_app.update_status_bar("Analyse feilet.", 100)
+            return
+
+        self.result_labels['buy_price'].setText(f"{results.get('buy_price', 0):,.2f} ISK")
+        self.result_labels['sell_price'].setText(f"{results.get('sell_price', 0):,.2f} ISK")
+        self.result_labels['buy_volume'].setText(f"{results.get('buy_volume', 0):,}")
+        self.result_labels['sell_volume'].setText(f"{results.get('sell_volume', 0):,}")
+        self.result_labels['transaction_cost'].setText(f"{results.get('transaction_cost', 0):,.2f} ISK")
+        self.result_labels['profit_per_unit'].setText(f"{results.get('profit_per_unit', 0):,.2f} ISK")
+        self.result_labels['units_per_trip'].setText(f"{results.get('units_per_trip', 0):,} (basert på {results.get('item_volume', 0):.2f} m³)")
+        self.result_labels['total_investment'].setText(f"{results.get('total_investment', 0):,.2f} ISK")
+        self.result_labels['total_profit'].setText(f"{results.get('total_profit', 0):,.2f} ISK")
+
+        profit_color = "green" if results.get('total_profit', 0) > 0 else "red"
+        self.result_labels['total_profit'].setStyleSheet(f"font-weight: bold; font-size: 14pt; color: {profit_color};")
+        self.main_app.update_status_bar("Analyse fullført.", 100)
+
+    def on_analysis_error(self, e):
+        self.run_vs_buy_button.setEnabled(True); self.run_vs_sell_button.setEnabled(True)
+        self.main_app.log_message(f"Uventet feil i analyse: {e}")
+        self.main_app.update_status_bar("Analyse feilet uventet.", 100)

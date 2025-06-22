@@ -1,59 +1,141 @@
-import customtkinter as ctk
-from tkinter import ttk
+import logging
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, 
+                             QComboBox, QCompleter, QGridLayout, QGroupBox, QTableWidget,
+                             QTableWidgetItem, QHeaderView, QCheckBox)
+from PyQt6.QtCore import QStringListModel, Qt
+from functools import partial
+import db
+from logic.scanners.price_hunter import run_price_hunter_scan
 
-def create_tab(tab_frame, app):
-    """
-    Creates the price hunter tab with a modern layout.
-    """
-    tab_frame.grid_columnconfigure(0, weight=1)
-    tab_frame.grid_rowconfigure(2, weight=1)
-    
-    # --- Header ---
-    header_frame = ctk.CTkFrame(tab_frame, fg_color="transparent")
-    header_frame.grid(row=0, column=0, padx=10, pady=(0, 20), sticky="ew")
-    ctk.CTkLabel(header_frame, text="Prisjeger", font=ctk.CTkFont(size=24, weight="bold")).pack(anchor="w")
+class PriceHunterTab(QWidget):
+    def __init__(self, main_app, parent=None):
+        super().__init__(parent)
+        self.main_app = main_app
+        self.full_scan_results = []
+        self.init_ui()
+        self.load_initial_data()
 
-    # --- Input Frame ---
-    input_frame = ctk.CTkFrame(tab_frame, fg_color=("gray92", "gray28"))
-    input_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=10)
-    input_frame.grid_columnconfigure(1, weight=1)
+    def init_ui(self):
+        main_layout = QVBoxLayout(self)
+        input_group = QGroupBox("Søk etter beste pris")
+        input_layout = QGridLayout(input_group)
 
-    ctk.CTkLabel(input_frame, text="Søk etter vare:", font=ctk.CTkFont(size=14)).grid(row=0, column=0, padx=15, pady=15, sticky="w")
-    app.price_hunter_item_entry = ctk.CTkEntry(input_frame, textvariable=app.price_hunter_item_name_var)
-    app.price_hunter_item_entry.grid(row=0, column=1, padx=15, pady=15, sticky="ew")
-    app.price_hunter_item_entry.bind("<KeyRelease>", app._update_suggestions)
+        input_layout.addWidget(QLabel("Vare:"), 0, 0)
 
-    security_frame = ctk.CTkFrame(input_frame, fg_color="transparent")
-    security_frame.grid(row=0, column=2, padx=15, pady=15)
-    ctk.CTkCheckBox(security_frame, text="High-sec", variable=app.price_hunter_hisec_var).pack(side="left", padx=5)
-    ctk.CTkCheckBox(security_frame, text="Low-sec", variable=app.price_hunter_lowsec_var).pack(side="left", padx=5)
-    ctk.CTkCheckBox(security_frame, text="Null-sec", variable=app.price_hunter_nullsec_var).pack(side="left", padx=5)
+        # --- KORRIGERING HER: Bytter til QComboBox for robust autofullfør ---
+        self.item_combo = QComboBox()
+        self.item_combo.setEditable(True)
+        self.item_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.item_combo.completer().setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+        self.item_combo.lineEdit().setPlaceholderText("Skriv for å søke etter en vare...")
+        input_layout.addWidget(self.item_combo, 0, 1, 1, 3)
+        # -------------------------------------------------------------------
 
-    app.price_hunter_scan_button = ctk.CTkButton(input_frame, text="Start Søk", command=app.start_price_hunter_scan, height=35)
-    app.price_hunter_scan_button.grid(row=0, column=3, padx=15, pady=15)
-    app.price_hunter_stop_button = ctk.CTkButton(input_frame, text="Stopp", command=app.stop_scan, state="disabled", height=35, fg_color="#D32F2F", hover_color="#B71C1C")
-    app.price_hunter_stop_button.grid(row=0, column=4, padx=15, pady=15)
+        self.hisec_check = QCheckBox("High-sec"); self.hisec_check.setChecked(True)
+        self.lowsec_check = QCheckBox("Low-sec"); self.lowsec_check.setChecked(True)
+        self.nullsec_check = QCheckBox("Null-sec"); self.nullsec_check.setChecked(True)
+        input_layout.addWidget(self.hisec_check, 1, 1)
+        input_layout.addWidget(self.lowsec_check, 1, 2)
+        input_layout.addWidget(self.nullsec_check, 1, 3)
 
-    # --- Result Frame ---
-    result_frame = ctk.CTkFrame(tab_frame, fg_color=("gray92", "gray28"))
-    result_frame.grid(row=2, column=0, sticky="nsew", padx=10, pady=10)
-    result_frame.grid_columnconfigure(0, weight=1)
-    result_frame.grid_rowconfigure(0, weight=1)
+        for checkbox in [self.hisec_check, self.lowsec_check, self.nullsec_check]:
+            checkbox.stateChanged.connect(self.update_display_from_filters)
 
-    columns = ('price', 'quantity', 'location', 'system', 'security')
-    app.price_hunter_tree = ttk.Treeview(result_frame, columns=columns, show="headings")
-    headings = {'price': 'Pris', 'quantity': 'Antall', 'location': 'Lokasjon', 'system': 'System', 'security': 'Sikkerhet'}
-    for col, text in headings.items():
-        app.price_hunter_tree.heading(col, text=text, command=lambda c=col: app.sort_results(app.price_hunter_tree, c, False))
-    
-    app.price_hunter_tree.column('price', anchor='e', width=150)
-    app.price_hunter_tree.column('quantity', anchor='e', width=120)
-    app.price_hunter_tree.column('location', anchor='w', width=300)
-    app.price_hunter_tree.column('system', anchor='w', width=150)
-    app.price_hunter_tree.column('security', anchor='center', width=100)
+        self.find_sell_button = QPushButton("Søk Beste Salgspris (Lavest)")
+        self.find_buy_button = QPushButton("Søk Beste Kjøpspris (Høyest)")
+        
+        self.find_sell_button.clicked.connect(partial(self.run_scan, 'sell'))
+        self.find_buy_button.clicked.connect(partial(self.run_scan, 'buy'))
+        
+        input_layout.addWidget(self.find_sell_button, 2, 1, 1, 2)
+        input_layout.addWidget(self.find_buy_button, 2, 3, 1, 2)
+        
+        main_layout.addWidget(input_group)
 
-    app.price_hunter_tree.grid(row=0, column=0, sticky="nsew", padx=(1,0), pady=1)
-    scrollbar = ttk.Scrollbar(result_frame, orient="vertical", command=app.price_hunter_tree.yview)
-    app.price_hunter_tree.configure(yscroll=scrollbar.set)
-    scrollbar.grid(row=0, column=1, sticky="ns", padx=(0,1), pady=1)
-    app.price_hunter_tree.bind("<Button-3>", app._on_tree_right_click)
+        self.results_table = QTableWidget()
+        headers = ['Pris', 'Antall', 'Lokasjon', 'System', 'Sikkerhet']
+        self.results_table.setColumnCount(len(headers))
+        self.results_table.setHorizontalHeaderLabels(headers)
+        self.results_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.results_table.setSortingEnabled(True)
+        main_layout.addWidget(self.results_table)
+
+    def load_initial_data(self):
+        self.all_item_names = db.get_all_item_names()
+        model = QStringListModel(self.all_item_names)
+        completer = QCompleter(model, self)
+        completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        self.item_combo.setCompleter(completer)
+
+    def run_scan(self, order_type):
+        item_name = self.item_combo.currentText()
+        if not item_name:
+            self.main_app.log_message("Vennligst skriv inn en vare å søke etter.")
+            return
+
+        type_id = db.get_item_id_by_name(item_name)
+        if not type_id:
+            self.main_app.log_message(f"Fant ikke varen '{item_name}'.")
+            return
+            
+        scan_config = {
+            'item_name': item_name, 'type_id': type_id, 'order_type': order_type,
+        }
+
+        self.find_buy_button.setEnabled(False); self.find_sell_button.setEnabled(False)
+        self.results_table.setRowCount(0)
+        self.main_app.update_status_bar(f"Søker etter beste {order_type}-pris for {item_name}...", 0)
+
+        self.main_app.run_in_thread(
+            run_price_hunter_scan, on_success=self.on_scan_success,
+            on_error=self.on_scan_error, scan_config=scan_config
+        )
+
+    def on_scan_success(self, results):
+        self.find_buy_button.setEnabled(True); self.find_sell_button.setEnabled(True)
+        self.main_app.update_status_bar(f"Prisjakt fullført. Fant {len(results)} mulige ordre.", 100)
+        self.full_scan_results = results
+        self.update_display_from_filters()
+
+    def update_display_from_filters(self):
+        if not self.full_scan_results: 
+            self.results_table.setRowCount(0)
+            return
+        
+        filtered_results = []
+        for order in self.full_scan_results:
+            sec = order['sec_status']
+            if (sec >= 0.5 and self.hisec_check.isChecked()) or \
+               (0.0 < sec < 0.5 and self.lowsec_check.isChecked()) or \
+               (sec <= 0.0 and self.nullsec_check.isChecked()):
+                filtered_results.append(order)
+        
+        self.display_results(filtered_results)
+
+    def display_results(self, results):
+        self.results_table.setRowCount(len(results))
+        for row, order in enumerate(results):
+            sec_val = order.get('sec_status', 0.0)
+            if sec_val >= 0.5: sec_str = f"High ({sec_val:.1f})"
+            elif sec_val > 0.0: sec_str = f"Low ({sec_val:.1f})"
+            else: sec_str = f"Null ({sec_val:.1f})"
+            
+            self.set_table_item_numeric(row, 0, order.get('price'), "{:,.2f} ISK")
+            self.set_table_item_numeric(row, 1, order.get('quantity'), "{:,}")
+            self.results_table.setItem(row, 2, QTableWidgetItem(order.get('location_name')))
+            self.results_table.setItem(row, 3, QTableWidgetItem(order.get('system_name')))
+            self.results_table.setItem(row, 4, QTableWidgetItem(sec_str))
+            
+        self.results_table.resizeColumnsToContents()
+
+    def on_scan_error(self, e):
+        self.find_buy_button.setEnabled(True); self.find_sell_button.setEnabled(True)
+        self.main_app.log_message(f"Feil under prissøk: {e}")
+        self.main_app.update_status_bar("Prisjakt feilet.", 100)
+        
+    def set_table_item_numeric(self, row, col, data, format_str="{:,.2f}"):
+        if data is None: data = 0
+        item = QTableWidgetItem(format_str.format(data))
+        item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.results_table.setItem(row, col, item)

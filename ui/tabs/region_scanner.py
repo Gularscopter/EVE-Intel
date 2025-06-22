@@ -1,78 +1,340 @@
-import customtkinter as ctk
-from tkinter import ttk
-import config
+# ui/tabs/region_scanner.py
+import sys
+import json
+import logging
+import os
+import pandas as pd
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QTableView,
+                             QHeaderView, QLabel, QLineEdit, QFormLayout, QAbstractItemView, QCheckBox, QGroupBox, QMenu)
+from PyQt6.QtCore import QAbstractTableModel, Qt, QThread, pyqtSignal, QTimer
+from PyQt6.QtGui import QColor, QAction
 
-def create_tab(tab_frame, app):
-    """
-    Creates the region/station trading scanner tab with a modern layout.
-    """
-    tab_frame.grid_columnconfigure(0, weight=1)
-    tab_frame.grid_rowconfigure(2, weight=1)
+sys.path.append('logic')
+from logic.scanners import region as region_helpers 
+import db
+import api
 
-    # --- Header ---
-    header_frame = ctk.CTkFrame(tab_frame, fg_color="transparent")
-    header_frame.grid(row=0, column=0, padx=10, pady=(0, 20), sticky="ew")
-    ctk.CTkLabel(header_frame, text="Stasjonshandel (Flipping)", font=ctk.CTkFont(size=24, weight="bold")).pack(anchor="w")
+class PandasModel(QAbstractTableModel):
+    def __init__(self, data):
+        super().__init__()
+        self._data = data
+    def rowCount(self, parent=None):
+        return len(self._data.index) if self._data is not None else 0
+    def columnCount(self, parent=None):
+        if self._data is not None:
+            return self._data.shape[1]
+        return 0
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if index.isValid():
+            if role == Qt.ItemDataRole.DisplayRole:
+                value = self._data.iloc[index.row(), index.column()]
+                if pd.isna(value): return ""
+                if isinstance(value, float): return f"{value:,.2f}"
+                if isinstance(value, int): return f"{value:,}"
+                return str(value)
+            if role == Qt.ItemDataRole.ForegroundRole:
+                column_name = self._data.columns[index.column()]
+                if column_name == 'Profit Per Unit': return QColor('lime')
+                if column_name == 'ROI': return QColor('cyan')
+        return None
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        if role == Qt.ItemDataRole.DisplayRole and orientation == Qt.Orientation.Horizontal:
+            return str(self._data.columns[section])
+        return None
+    def sort(self, column, order):
+        self.layoutAboutToBeChanged.emit()
+        col_name = self._data.columns[column]
+        self._data = self._data.sort_values(by=col_name, ascending=(order == Qt.SortOrder.AscendingOrder))
+        self.layoutChanged.emit()
+    def updateData(self, data):
+        self.beginResetModel()
+        self._data = data
+        self.endResetModel()
 
-    # --- Settings Frame ---
-    settings_frame = ctk.CTkFrame(tab_frame, fg_color=("gray92", "gray28"))
-    settings_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=10)
-    for i in range(4): settings_frame.grid_columnconfigure(i, weight=1)
+class RegionScannerWorker(QThread):
+    item_found = pyqtSignal(dict)
+    finished = pyqtSignal()
+    error = pyqtSignal(str)
+    progress = pyqtSignal(str, int)
 
-    # Column 0: Station
-    ctk.CTkLabel(settings_frame, text="Handelshub").grid(row=0, column=0, padx=10, pady=5)
-    station_names = list(config.STATIONS_INFO.keys())
-    ctk.CTkComboBox(settings_frame, variable=app.region_station_var, values=station_names, state="readonly").grid(row=1, column=0, padx=10, pady=5, sticky="ew")
+    def __init__(self, config, items, access_token, parent=None):
+        super().__init__(parent)
+        self.config = config
+        self.access_token = access_token
+        # --- NYTT: Oppretter en ID -> Navn map én gang her ---
+        self.id_to_name_map = {v: k for k, v in items.items()}
+
+    # --- NYTT: Hjelpefunksjon for å finne navn, nå en del av klassen ---
+    def get_item_name(self, item_id):
+        return self.id_to_name_map.get(item_id, f"Unknown ID: {item_id}")
+
+    def run(self):
+        try:
+            self._scan_region_logic()
+        except Exception as e:
+            logging.error("Feil i worker-tråden for RegionScanner", exc_info=True)
+            self.error.emit(f"An error occurred in worker: {e}")
+        finally:
+            self.finished.emit()
+
+    def _scan_region_logic(self):
+        cfg = self.config
+        
+        item_ids_to_scan = []
+        if cfg['trace_item_name']:
+            logging.info(f"SPORINGSMODUS: Kjører kun for varen '{cfg['trace_item_name']}'.")
+            trace_item_id = db.get_item_id_by_name(cfg['trace_item_name'])
+            if not trace_item_id:
+                self.progress.emit(f"Fant ikke varen '{cfg['trace_item_name']}'", 100)
+                return
+            item_ids_to_scan = [trace_item_id]
+        else:
+            logging.info(f"scan_region startet.")
+            item_ids_to_scan = list(self.id_to_name_map.keys())
+
+        if not item_ids_to_scan:
+            self.progress.emit("Ingen varer å skanne.", 100)
+            return
+
+        results_generator = region_helpers.scan_region_for_profit(
+            config=cfg,
+            item_ids=item_ids_to_scan,
+            access_token=self.access_token,
+            progress_callback=self.progress.emit
+        )
+
+        for item_data in results_generator:
+            if self.isInterruptionRequested():
+                logging.info("Skanning avbrutt av bruker.")
+                break
+            
+            item_data['Item Name'] = self.get_item_name(item_data['Item ID'])
+            self.item_found.emit(item_data)
+
+class RegionScannerTab(QWidget):
+    def __init__(self, main_app, parent=None):
+        super().__init__(parent)
+        self.main_app = main_app
+        self.is_scanning = False
+        self.items = None
+        self.all_found_items = []
+        self.df_columns = [
+            'Item ID', 'Item Name', 'Profit Per Unit', 'ROI',
+            'Lowest Sell', 'Highest Buy', 'Median Daily Vol', 'Aktive Dager'
+        ]
+        self.update_timer = QTimer(self)
+        self.update_timer.setInterval(500)
+        self.update_timer.setSingleShot(True)
+        self.update_timer.timeout.connect(self.update_table_display) 
+        self.init_ui()
+        self.load_items()
+
+    def init_ui(self):
+        main_layout = QVBoxLayout(self)
+        filter_groupbox = QGroupBox("Filter-innstillinger")
+        form_layout = QFormLayout()
+        self.min_profit_input = QLineEdit("10000")
+        self.min_profit_input.setToolTip("Minimum nettofortjeneste per enhet etter at alle avgifter er betalt.")
+        self.min_abs_spread_input = QLineEdit("50000")
+        self.min_abs_spread_input.setToolTip("Minimum prisforskjell i ren ISK mellom laveste salgsordre og høyeste kjøpsordre.")
+        self.min_rel_spread_input = QLineEdit("5")
+        self.min_rel_spread_input.setToolTip("Minimum prisforskjell i prosent (margin).")
+        self.min_volume_input = QLineEdit("5")
+        self.min_volume_input.setToolTip("Minimum median antall enheter som omsettes hver dag (siste 7 dager).")
+        self.min_active_days_input = QLineEdit("4")
+        self.min_active_days_input.setToolTip("Minimum antall dager (av de siste 7) varen må ha hatt salg på.")
+        self.min_liquidity_input = QLineEdit("50000000")
+        self.min_liquidity_input.setToolTip("Minimum totalverdi (i ISK) av alle kjøpsordrer på markedet for denne varen.")
+        self.sales_tax_input = QLineEdit("3.6")
+        self.sales_tax_input.setToolTip("Din 'Sales Tax'-rate i prosent.")
+        self.broker_fee_input = QLineEdit("3.0")
+        self.broker_fee_input.setToolTip("Din 'Broker's Fee'-rate i prosent.")
+        form_layout.addRow("Min Nettofortjeneste (ISK):", self.min_profit_input)
+        form_layout.addRow("Min Prisforskjell (ISK):", self.min_abs_spread_input)
+        form_layout.addRow("Min Margin (%):", self.min_rel_spread_input)
+        form_layout.addRow("Min Daglig Volum (Median 7d):", self.min_volume_input)
+        form_layout.addRow("Min Antall Handelsdager (siste 7):", self.min_active_days_input)
+        form_layout.addRow("Min Markedslikviditet (ISK):", self.min_liquidity_input)
+        form_layout.addRow("Sales Tax (%):", self.sales_tax_input)
+        form_layout.addRow("Broker's Fee (%):", self.broker_fee_input)
+        filter_groupbox.setLayout(form_layout)
+        debug_groupbox = QGroupBox("Feilsøking")
+        debug_layout = QVBoxLayout()
+        self.trace_layout = QHBoxLayout()
+        self.trace_item_checkbox = QCheckBox("Spor spesifikk vare:")
+        self.trace_item_input = QLineEdit()
+        self.trace_item_input.setPlaceholderText("Skriv inn nøyaktig varenavn...")
+        self.trace_item_input.setEnabled(False)
+        self.trace_item_checkbox.toggled.connect(self.trace_item_input.setEnabled)
+        self.trace_layout.addWidget(self.trace_item_checkbox)
+        self.trace_layout.addWidget(self.trace_item_input)
+        debug_layout.addLayout(self.trace_layout)
+        debug_groupbox.setLayout(debug_layout)
+        self.scan_button = QPushButton("Start Skanning")
+        self.scan_button.clicked.connect(self.toggle_scan)
+        self.status_label = QLabel("Ready.")
+        self.results_table = QTableView()
+        self.results_table.setSortingEnabled(True)
+        header = self.results_table.horizontalHeader()
+        if header:
+            header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.results_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.results_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.model = PandasModel(pd.DataFrame(columns=self.df_columns))
+        self.results_table.setModel(self.model)
+        self.results_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.results_table.customContextMenuRequested.connect(self.show_table_context_menu)
+        main_layout.addWidget(filter_groupbox)
+        main_layout.addWidget(debug_groupbox)
+        main_layout.addWidget(self.scan_button)
+        main_layout.addWidget(self.status_label)
+        main_layout.addWidget(self.results_table)
+
+    def load_items(self):
+        logging.info("Laster varer fra items_filtered.json...")
+        try:
+            # Construct an absolute path to the JSON file
+            script_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            file_path = os.path.join(script_dir, 'items_filtered.json')
+            
+            with open(file_path, 'r') as f:
+                self.items = json.load(f)
+
+            if not self.items or not isinstance(self.items, dict) or len(self.items) == 0:
+                self.status_label.setText("Error: 'items_filtered.json' is empty or invalid.")
+                self.scan_button.setEnabled(False)
+            else:
+                self.status_label.setText(f"Loaded {len(self.items)} items. Ready.")
+                self.scan_button.setEnabled(True)
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            logging.error(f"Could not load 'items_filtered.json': {e}")
+            self.status_label.setText("Error: Could not load 'items_filtered.json'.")
+            self.scan_button.setEnabled(False)
+
+    def update_scan_status(self, message, percentage):
+        self.status_label.setText(f"{message} [{percentage}%]")
+
+    def toggle_scan(self):
+        if self.is_scanning:
+            if hasattr(self, 'worker') and self.worker and self.worker.isRunning():
+                logging.info("Stopp-signal sendt til scanner.")
+                self.worker.requestInterruption()
+                self.scan_button.setEnabled(False)
+                self.status_label.setText("Stopper skanning...")
+        else:
+            self.start_scan()
+
+    def start_scan(self):
+        if not self.items: return
+        try:
+            self.scan_config = {
+                "min_profit": float(self.min_profit_input.text().replace(",", "")),
+                "min_avg_vol": int(self.min_volume_input.text().replace(",", "")),
+                "min_active_days": int(self.min_active_days_input.text().replace(",", "")),
+                "sales_tax_rate": float(self.sales_tax_input.text()) / 100,
+                "broker_fee_rate": float(self.broker_fee_input.text()) / 100,
+                "min_abs_spread": float(self.min_abs_spread_input.text().replace(",", "")),
+                "min_rel_spread": float(self.min_rel_spread_input.text()) / 100,
+                "min_liquidity": float(self.min_liquidity_input.text().replace(",", "")),
+                "is_debugging": self.trace_item_checkbox.isChecked(),
+                "trace_item_name": self.trace_item_input.text() if self.trace_item_checkbox.isChecked() else None,
+                "region_id": 10000002
+            }
+            if self.scan_config['trace_item_name']:
+                self.scan_config['is_debugging'] = True
+        except ValueError:
+            self.status_label.setText("Error: Invalid number format in settings.")
+            return
+
+        access_token = self.main_app.auth_manager.get_valid_token()
+        if not access_token:
+            self.status_label.setText("Error: Not authenticated. Please log in.")
+            return
+
+        self.all_found_items = []
+        self.model.updateData(pd.DataFrame(columns=self.df_columns))
+        self.is_scanning = True
+        self.scan_button.setText("Stopp Skanning")
+        self.scan_button.setStyleSheet("background-color: #A03030; color: white;")
+        self.worker = RegionScannerWorker(self.scan_config, self.items, access_token)
+        self.worker.item_found.connect(self.on_item_found)
+        self.worker.finished.connect(self.on_scan_finished)
+        self.worker.error.connect(self.on_scan_error)
+        self.worker.progress.connect(self.update_scan_status)
+        self.worker.start()
+
+    def on_item_found(self, item_data):
+        item_name = item_data.get('Item Name', 'N/A')
+        # ... (resten av logikken er uendret og bruker nå scan_config)
+        current_lowest_sell = item_data.get('Lowest Sell', 0)
+        current_highest_buy = item_data.get('Highest Buy', 0)
+        if not (current_lowest_sell > current_highest_buy): return
+        our_buy_price = current_highest_buy + 0.01
+        our_sell_price = current_lowest_sell - 0.01
+        gross_profit = our_sell_price - our_buy_price
+        total_fees = (our_sell_price * self.scan_config['broker_fee_rate']) + (our_buy_price * self.scan_config['broker_fee_rate']) + (our_sell_price * self.scan_config['sales_tax_rate'])
+        profit_per_unit = gross_profit - total_fees
+        if profit_per_unit < self.scan_config['min_profit']: return
+        item_data['Vår Kjøpspris'] = our_buy_price
+        item_data['Vår Salgspris'] = our_sell_price
+        item_data['Profit Per Unit'] = profit_per_unit
+        item_data['ROI'] = (profit_per_unit / our_buy_price) * 100 if our_buy_price > 0 else 0
+        self.all_found_items.append(item_data)
+        if not self.update_timer.isActive():
+            self.update_timer.start()
+
+    def _reset_scan_ui(self):
+        self.is_scanning = False
+        self.scan_button.setText("Start Skanning")
+        self.scan_button.setStyleSheet("")
+        self.scan_button.setEnabled(True)
+
+    def on_scan_finished(self):
+        self.update_table_display()
+        self.status_label.setText(f"Skanning fullført. Fant {len(self.all_found_items)} lønnsomme varer.")
+        self._reset_scan_ui()
     
-    # Column 1: Filters
-    ctk.CTkLabel(settings_frame, text="Min. profitt/enhet").grid(row=0, column=1, padx=10, pady=5)
-    ctk.CTkEntry(settings_frame, textvariable=app.region_min_profit_var).grid(row=1, column=1, padx=10, pady=5, sticky="ew")
-    ctk.CTkLabel(settings_frame, text="Min. daglig volum").grid(row=2, column=1, padx=10, pady=5)
-    ctk.CTkEntry(settings_frame, textvariable=app.region_min_volume_var).grid(row=3, column=1, padx=10, pady=5, sticky="ew")
+    def on_scan_error(self, error_message):
+        logging.error(f"En feil ble fanget av UI: {error_message}")
+        self.status_label.setText(f"Error: {error_message}")
+        self._reset_scan_ui()
 
-    # Column 2: Investment
-    ctk.CTkLabel(settings_frame, text="Maks. investering").grid(row=0, column=2, padx=10, pady=5)
-    ctk.CTkEntry(settings_frame, textvariable=app.region_max_investment_var).grid(row=1, column=2, padx=10, pady=5, sticky="ew")
+    def update_table_display(self):
+        if not self.all_found_items: return
+        self.all_found_items.sort(key=lambda x: x['Profit Per Unit'], reverse=True)
+        display_df = pd.DataFrame(self.all_found_items)
+        for col in self.df_columns:
+            if col not in display_df.columns:
+                display_df[col] = pd.NA
+        self.model.updateData(display_df[self.df_columns])
 
-    # Column 3: Controls
-    button_frame = ctk.CTkFrame(settings_frame, fg_color="transparent")
-    button_frame.grid(row=1, column=3, rowspan=2)
-    app.region_scan_button = ctk.CTkButton(button_frame, text="Start Skann", command=app.start_region_scan, height=40)
-    app.region_scan_button.pack(pady=5)
-    app.region_stop_button = ctk.CTkButton(button_frame, text="Stopp", command=app.stop_scan, state="disabled", height=30, fg_color="#D32F2F", hover_color="#B71C1C")
-    app.region_stop_button.pack(pady=5)
+    def show_table_context_menu(self, position):
+        index = self.results_table.indexAt(position)
+        if not index.isValid(): return
+        row = index.row()
+        item_name = self.model._data.iloc[row]['Item Name']
+        item_id = self.model._data.iloc[row]['Item ID']
+        menu = QMenu()
+        open_action = QAction(f"Åpne '{item_name}' i markedet", self)
+        open_action.triggered.connect(lambda: self.trigger_open_market_window(item_id))
+        menu.addAction(open_action)
+        
+        viewport = self.results_table.viewport()
+        if viewport:
+            menu.exec(viewport.mapToGlobal(position))
 
-    # Progress Bar
-    progress_frame = ctk.CTkFrame(settings_frame, fg_color="transparent")
-    progress_frame.grid(row=4, column=0, columnspan=4, sticky="ew", pady=10)
-    progress_frame.grid_columnconfigure(0, weight=1)
-    app.region_progress = ctk.CTkProgressBar(progress_frame)
-    app.region_progress.set(0)
-    app.region_progress.grid(row=0, column=0, sticky="ew", padx=10)
-    app.region_scan_details_label = ctk.CTkLabel(progress_frame, text="")
-    app.region_scan_details_label.grid(row=0, column=1, padx=10)
-
-    # --- Result Frame ---
-    result_frame = ctk.CTkFrame(tab_frame, fg_color=("gray92", "gray28"))
-    result_frame.grid(row=2, column=0, sticky="nsew", padx=10, pady=10)
-    result_frame.grid_columnconfigure(0, weight=1)
-    result_frame.grid_rowconfigure(0, weight=1)
-    
-    columns = ('item', 'profit_unit', 'margin', 'daily_vol', 'buy_price', 'sell_price', 'competition', 'trend')
-    app.region_tree = ttk.Treeview(result_frame, columns=columns, show="headings")
-    headings = {'item':'Vare', 'profit_unit':'Profitt/enhet', 'margin':'Margin %', 'daily_vol':'Daglig Volum', 'buy_price':'Kjøpspris', 'sell_price':'Salgspris', 'competition':'Konkurrenter', 'trend':'Trend'}
-    for col, text in headings.items():
-        app.region_tree.heading(col, text=text, command=lambda c=col: app.sort_results(app.region_tree, c, False))
-
-    app.region_tree.column('item', anchor='w', width=250)
-    for col in columns[1:]: app.region_tree.column(col, anchor='e', width=120)
-    
-    app.region_tree.tag_configure('golden_deal', background='#6a5101')
-    app.region_tree.tag_configure('excellent_deal', background='#1B5E20')
-    app.region_tree.tag_configure('good_deal', background='#2E7D32')
-
-    app.region_tree.grid(row=0, column=0, sticky="nsew", padx=(1,0), pady=1)
-    scrollbar = ttk.Scrollbar(result_frame, orient="vertical", command=app.region_tree.yview)
-    app.region_tree.configure(yscroll=scrollbar.set)
-    scrollbar.grid(row=0, column=1, sticky="ns", padx=(0,1), pady=1)
-    app.region_tree.bind("<Button-3>", app._on_tree_right_click)
+    def trigger_open_market_window(self, type_id):
+        access_token = self.main_app.auth_manager.get_valid_token()
+        if not access_token:
+            self.main_app.update_status_bar("Kan ikke åpne markedet: Du er ikke logget inn.")
+            return
+        self.main_app.update_status_bar(f"Sender kommando for vare-ID {type_id}...")
+        self.main_app.run_in_thread(
+            fn=api.open_market_window,
+            on_success=lambda result: self.main_app.update_status_bar(
+                "Signal sendt til EVE-klienten." if result else "Kunne ikke sende signal.", 100
+            ),
+            on_error=lambda e: self.main_app.update_status_bar(f"Feil ved åpning av marked: {e}"),
+            type_id=type_id,
+            access_token=access_token
+        )
